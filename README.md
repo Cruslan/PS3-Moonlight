@@ -55,7 +55,7 @@ Moonlight PS3 is an open-source PlayStation 3 homebrew client for NVIDIA GameStr
 - **[Moonlight-QT](https://github.com/moonlight-stream/moonlight-qt)**: Core client logic, GameStream/Sunshine protocol handling, icon/graphics assets, and streaming implementation are directly adapted from Moonlight-QT.
 - **[Opus Interactive Audio Codec](https://opus-codec.org/)**: Audio decoding functionality is powered by the Opus codec library.
 - **[Moonlight Common C](https://github.com/moonlight-stream/moonlight-common-c)**: Common GameStream client library.
-- **Mohasi**: Special thanks for technical guidance, problem-solving support, and project inspiration.
+- **[Mohammed Asif (mohasi)](https://codeberg.org/mohasi)**: Special thanks for technical guidance, problem-solving support, and project inspiration.
 
 ## License
 
