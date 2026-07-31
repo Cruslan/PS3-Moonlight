@@ -1,0 +1,66 @@
+# Moonlight PS3
+
+Moonlight PS3 is an open-source PlayStation 3 homebrew client for NVIDIA GameStream and Sunshine servers, built using the PSL1GHT SDK, Tiny3D graphics library, `cellVdec` hardware decoder, and Opus audio decoding.
+
+## Features
+
+- **Hardware Accelerated H.264 Video Decoding**: High-performance 720p60 H.264 video decoding using the PS3 Cell Broadband Engine `cellVdec` hardware decoder interface, mapped directly to RSX graphics memory via Tiny3D.
+- **Bundled Third-Party Architecture**: Third-party libraries (`moonlight-common-c` and `opus`) are integrated and modified directly in-tree inside `third_party/`, removing external Git submodule dependencies for zero-friction compilation.
+- **OpenSSL Compatibility & Crypto Emulation Layer**: Custom OpenSSL abstraction layer (`src/openssl_compat.c`) translating crypto and TLS operations to PolarSSL/mbedTLS to prevent library symbol collisions on PSL1GHT.
+- **Low-Latency Opus Multistream Audio**: Custom PS3 audio backend (`src/audio/ps3.c`) featuring thread-safe ring buffering, low-latency PCM playback via `sysAudio`, and automatic buffer underflow/overflow recovery.
+- **Full GameStream / Sunshine Protocol Support**: Built-in HTTP/HTTPS pairing pipeline (`src/handshake.c`) supporting client certificate generation, PIN challenge handshake, RTSP stream setup, and session control.
+- **DualShock 3 Input Engine**: Low-latency gamepad input processing via `sysUtil` with analog stick deadzone filtering, mapped buttons, and emergency stream abort hotkeys (`Select + Start + L3 + R3`).
+- **Real-Time Instrumentation & Performance HUD**: On-screen metrics display monitoring FPS, network RTT, video decode latency, render overhead, and packet loss statistics.
+- **Universal NPDRM Package Build Pipeline**: Native `ppu-strip`, `fself`, and `make_self_npdrm` integration generating retail-signed PKG files compatible with both RPCS3 emulator and physical PS3 consoles (CFW / HEN).
+
+## Prerequisites
+
+- **PS3 Toolchain**: `ps3dev` / PSL1GHT PPU toolchain (`ppu-gcc`, `make_self_npdrm`, `sprxlinker`, `pkg`). Automatically installed via `make prepare`.
+
+## Quick Start & Building from Source
+
+1. **Clone the Repository**:
+   ```bash
+   git clone https://github.com/Cruslan/PS3-Moonlight
+   cd moonlight-ps3
+   ```
+
+2. **Prepare the PS3 SDK Environment**:
+   Downloads and extracts the pre-compiled `ps3dev` PPU toolchain and PSL1GHT SDK archive directly into `./ps3dev` inside the project directory. This provides the `ppu-gcc` cross-compiler, Cell Broadband Engine PPU headers, system libraries (`sysAudio`, `sysUtil`, `cellVdec`, `Tiny3D`, `PolarSSL`), and PKG packaging tools (`make_self_npdrm`, `fself`, `pkg`), enabling isolated building without requiring system-wide installations or root privileges:
+   ```bash
+   make prepare
+   ```
+
+3. **Build the Package**:
+   Compile the client binary and generate the signed installation packages:
+   ```bash
+   make
+   ```
+   To perform a full clean rebuild at any time:
+   ```bash
+   make clean && make
+   ```
+
+4. **Output Packages**:
+   Upon completion, the build outputs the following installable files:
+   - `moonlight-ps3.pkg`: Dual-compatible PKG installer for RPCS3 emulator and physical PS3 consoles (CFW / HEN).
+   - `moonlight-ps3.gnpdrm.pkg`: Finalized NPDRM PKG package.
+
+## Usage & Pairing
+
+1. Install `moonlight-ps3.pkg` on your PlayStation 3 console (CFW/HEN) or RPCS3 emulator.
+2. Ensure your host PC running Sunshine or NVIDIA GameStream is connected to the same local network.
+3. Launch Moonlight PS3.
+4. Set your host PC IP address.
+5. When pairing with Sunshine / GameStream, enter the default client pairing PIN: **`0000`**.
+
+## Credits & Acknowledgments
+
+- **[Moonlight-QT](https://github.com/moonlight-stream/moonlight-qt)**: Core client logic, GameStream/Sunshine protocol handling, icon/graphics assets (`ICON0.PNG`), and streaming implementation are directly adapted from Moonlight-QT (GPLv3).
+- **[Opus Interactive Audio Codec](https://opus-codec.org/)**: Audio decoding functionality is powered by the Opus codec library (`third_party/opus`).
+- **[Moonlight Common C](https://github.com/moonlight-stream/moonlight-common-c)**: Common GameStream client library (`third_party/moonlight-common-c`).
+- **Mohasi**: Special thanks for technical guidance, problem-solving support, and project inspiration.
+
+## License
+
+This project is released under the GNU General Public License v3.0 (GPLv3).

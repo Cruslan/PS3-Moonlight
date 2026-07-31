@@ -1,0 +1,25 @@
+# PS3 Toolchain (installed via make prepare)
+ps3dev/
+ps3dev-*.tar.gz
+
+# Build outputs and temporary packaging files
+build/
+*.elf
+*.self
+*.fake.self
+*.pkg
+*.gnpdrm.pkg
+PARAM.SFO
+
+# Object files and static archives
+*.o
+*.a
+src/*.o
+src/*/*.o
+third_party/**/*.o
+third_party/**/*.a
+
+# OS & Editor temporary files
+.DS_Store
+*.swp
+*~
