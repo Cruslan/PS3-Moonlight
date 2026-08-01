@@ -26,7 +26,7 @@ Moonlight PS3 is an open-source PlayStation 3 homebrew client for NVIDIA GameStr
    ```
 
 2. **Prepare the PS3 SDK Environment**:
-   Automatically detects your host operating system and architecture (`macOS Apple Silicon ARM64`, `macOS Intel x64`, or `Linux x64`), then downloads and extracts the official pre-compiled `ps3dev` PPU toolchain and PSL1GHT SDK archive directly into `./ps3dev` inside the project directory. This sets up the `ppu-gcc` cross-compiler, Cell Broadband Engine PPU headers, system libraries (`sysAudio`, `sysUtil`, `cellVdec`, `Tiny3D`, `PolarSSL`), and PKG packaging utilities (`make_self_npdrm`, `fself`, `pkg`), enabling completely isolated zero-friction builds without requiring system-wide toolchain installations or root privileges:
+   Automatically downloads and extracts the pre-compiled `ps3dev` SDK and PSL1GHT toolchain for your host OS (macOS ARM64/x64 or Linux x64) into `./ps3dev` for isolated, zero-friction builds:
    ```bash
    make prepare
    ```
