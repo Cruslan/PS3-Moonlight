@@ -58,6 +58,7 @@ Moonlight PS3 is an open-source PlayStation 3 homebrew client for NVIDIA GameStr
 
 ## Acknowledgments & Special Thanks
 
+- **[PS3DEV / PSL1GHT SDK](https://github.com/ps3dev/ps3dev)**: Enormous thanks to the open-source PS3 toolchain and PSL1GHT SDK developers whose foundational work, cross-compilers, hardware header definitions, and libraries made this PlayStation 3 port possible.
 - **[Mohammed Asif (mohasi)](https://codeberg.org/mohasi)**: Special thanks for technical guidance, problem-solving support, and project inspiration.
 - **AcidNT3.1**: Special thanks for testing and feedback during development.
 - **SyrianClippy**: Special thanks for testing and feedback during development.
