@@ -1,0 +1,19 @@
+PS3DEV	?= $(abspath ../../ps3dev)
+CFLAGS	:=	-O2 -Wall -I$(PS3DEV)/ppu/include -I$(PS3DEV)/portlibs/ppu/include -I./src -I./enet/include -I./reedsolomon -mcpu=cell -DUSE_MBEDTLS -DHAS_SOCKLEN_T -DNO_MSGAPI -DHAS_POLL -include src/ps3_compat.h
+
+SRC		:=	$(wildcard src/*.c) $(wildcard reedsolomon/*.c) enet/callbacks.c enet/host.c enet/list.c enet/packet.c enet/peer.c enet/protocol.c enet/unix.c
+OBJ		:=	$(SRC:.c=.o)
+TARGET	:=	libmoonlight-common-c.a
+
+all: $(TARGET)
+
+$(TARGET): $(OBJ)
+	$(AR) rcs $@ $(OBJ)
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+clean:
+	gio trash $(OBJ) $(TARGET) 2>/dev/null || true
+
+.PHONY: all clean
