@@ -7,10 +7,9 @@
 
 #include "video/ps3.h"
 #include "audio/ps3.h"
-#include "input/ps3.h"
 #include "net_logger.h"
 
-static int connection_status = LI_DISCONNECTED;
+static volatile int connection_status = LI_DISCONNECTED;
 int connection_stage = 0;
 
 void ps3_debug_log(const char* fmt, ...) {
@@ -42,27 +41,27 @@ static void cb_connection_started(void) {
     connection_status = LI_CONNECTED;
     ps3video_start();
     ps3audio_start();
-    ps3input_start();
 }
 
 static void cb_connection_terminated(int error_code) {
     NLOG("connectionTerminated err=%d", error_code);
-    LiStopConnection();
-    if (connection_status == LI_CONNECTED) {
-        ps3video_stop();
-        ps3audio_stop();
-        ps3input_stop();
-    }
     connection_status = LI_DISCONNECTED;
 }
 
-static void cb_rumble(unsigned short c, unsigned short l, unsigned short h) {}
+static void cb_rumble(unsigned short c, unsigned short l, unsigned short h) {
+    (void)c; (void)l; (void)h;
+}
 static void cb_status_update(int status) { NLOG("statusUpdate: %d", status); }
-static void cb_set_hdr(bool enabled) {}
-static void cb_rumble_triggers(uint16_t c, uint16_t l, uint16_t r) {}
-static void cb_set_motion(uint16_t c, uint8_t t, uint16_t r) {}
-static void cb_set_led(uint16_t c, uint8_t r, uint8_t g, uint8_t b) {}
-static void cb_set_adaptive_triggers(uint16_t c, uint8_t* lp, uint32_t ll, uint8_t* rp, uint32_t rl) {}
+static void cb_set_hdr(bool enabled) { (void)enabled; }
+static void cb_rumble_triggers(uint16_t c, uint16_t l, uint16_t r) {
+    (void)c; (void)l; (void)r;
+}
+static void cb_set_motion(uint16_t c, uint8_t t, uint16_t r) {
+    (void)c; (void)t; (void)r;
+}
+static void cb_set_led(uint16_t c, uint8_t r, uint8_t g, uint8_t b) {
+    (void)c; (void)r; (void)g; (void)b;
+}
 
 bool connection_is_ready(void) { return connection_status != LI_DISCONNECTED; }
 bool connection_is_connected(void) { return connection_status == LI_CONNECTED; }
@@ -90,5 +89,6 @@ void connection_callbacks_init(void) {
     connection_callbacks.rumbleTriggers       = cb_rumble_triggers;
     connection_callbacks.setMotionEventState  = cb_set_motion;
     connection_callbacks.setControllerLED     = cb_set_led;
+    connection_status = LI_READY;
     NLOG("cb_init: done");
 }

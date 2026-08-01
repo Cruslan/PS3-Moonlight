@@ -1,20 +1,33 @@
 #include "ps3.h"
 #include <Limelight.h>
 #include <io/pad.h>
+#include <string.h>
+#include <sys/mutex.h>
 #include <sys/thread.h>
 #include <unistd.h>
 
-static int active_input_thread = 1;
+static volatile int active_input_thread = 0;
+static int input_thread_started = 0;
 static sys_ppu_thread_t input_thread;
 static ps3_pad_state_t g_pad_state = {0};
+static sys_mutex_t pad_state_mutex;
+static int pad_state_mutex_initialized = 0;
 
 void ps3input_get_data(ps3_pad_state_t *state) {
-    if (state) *state = g_pad_state;
-    // Clear pressed flags after read to act as one-shot
+    if (!state) return;
+    if (!pad_state_mutex_initialized) {
+        memset(state, 0, sizeof(*state));
+        return;
+    }
+
+    sysMutexLock(pad_state_mutex, 0);
+    *state = g_pad_state;
     g_pad_state.buttons_pressed = 0;
+    sysMutexUnlock(pad_state_mutex);
 }
 
 static void input_loop(void *arg) {
+    (void)arg;
     padInfo padinfo;
     padData paddata;
     int last_buttons = 0;
@@ -89,16 +102,26 @@ static void input_loop(void *arg) {
                     LiSendControllerEvent(buttonFlags, leftTrigger, rightTrigger, leftStickX, leftStickY, rightStickX, rightStickY);
 
                     // Update shared state for UI
+                    sysMutexLock(pad_state_mutex, 0);
                     g_pad_state.buttons_down = buttonFlags;
                     g_pad_state.buttons_pressed |= (buttonFlags & ~last_buttons);
                     g_pad_state.lx = leftStickX;
                     g_pad_state.ly = leftStickY;
                     g_pad_state.rx = rightStickX;
                     g_pad_state.ry = rightStickY;
+                    sysMutexUnlock(pad_state_mutex);
 
                     last_buttons = buttonFlags;
                 }
             }
+        }
+
+        if (!padinfo.status[0] && last_buttons != 0) {
+            LiSendControllerEvent(0, 0, 0, 0, 0, 0, 0);
+            sysMutexLock(pad_state_mutex, 0);
+            memset(&g_pad_state, 0, sizeof(g_pad_state));
+            sysMutexUnlock(pad_state_mutex);
+            last_buttons = 0;
         }
 
         usleep(4000); // 250 Hz polling (4ms) for ultra-low latency
@@ -109,13 +132,34 @@ static void input_loop(void *arg) {
 }
 
 void ps3input_start() {
+    if (input_thread_started) return;
+
+    sys_mutex_attr_t attr;
+    sysMutexAttrInitialize(attr);
+    if (sysMutexCreate(&pad_state_mutex, &attr) != 0) return;
+    pad_state_mutex_initialized = 1;
+
+    memset(&g_pad_state, 0, sizeof(g_pad_state));
     active_input_thread = 1;
     // Priority 200: Input should preempt almost everything except critical network receive (100)
-    sysThreadCreate(&input_thread, input_loop, 0, 200, 0x2000, THREAD_JOINABLE, "InputThread");
+    if (sysThreadCreate(&input_thread, input_loop, 0, 200, 0x2000,
+                        THREAD_JOINABLE, "InputThread") != 0) {
+        active_input_thread = 0;
+        sysMutexDestroy(pad_state_mutex);
+        pad_state_mutex_initialized = 0;
+        return;
+    }
+    input_thread_started = 1;
 }
 
 void ps3input_stop() {
+    if (!input_thread_started) return;
     active_input_thread = 0;
     u64 retval;
     sysThreadJoin(input_thread, &retval);
+    input_thread_started = 0;
+    if (pad_state_mutex_initialized) {
+        sysMutexDestroy(pad_state_mutex);
+        pad_state_mutex_initialized = 0;
+    }
 }

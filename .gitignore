@@ -1,6 +1,7 @@
 # PS3 Toolchain (installed via make prepare)
 ps3dev/
 ps3dev-*.tar.gz
+ps3dev-*.tar.gz.tmp
 
 # Build outputs and temporary packaging files
 build/
@@ -13,6 +14,7 @@ PARAM.SFO
 
 # Object files and static archives
 *.o
+*.d
 *.a
 src/*.o
 src/*/*.o

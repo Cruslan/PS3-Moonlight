@@ -8,16 +8,33 @@ ICON0		:= ICON0.PNG
 SFOXML		:= sfo.xml
 
 
-SDK_URL		:= https://github.com/ps3dev/ps3dev/releases/download/nightly-2026-07-26/ps3dev-linux-X64.tar.gz
-SDK_TAR		:= ps3dev-linux-X64.tar.gz
+SDK_RELEASE	:= nightly-2026-07-26
+HOST_OS		:= $(shell uname -s)
+HOST_ARCH	:= $(shell uname -m)
+
+ifeq ($(HOST_OS)-$(HOST_ARCH),Darwin-arm64)
+SDK_ASSET	:= ps3dev-macos-ARM64.tar.gz
+else ifeq ($(HOST_OS)-$(HOST_ARCH),Darwin-x86_64)
+SDK_ASSET	:= ps3dev-macos-X64.tar.gz
+else ifeq ($(HOST_OS)-$(HOST_ARCH),Linux-x86_64)
+SDK_ASSET	:= ps3dev-linux-X64.tar.gz
+else
+$(error Unsupported build host: $(HOST_OS)-$(HOST_ARCH))
+endif
+
+SDK_URL		:= https://github.com/ps3dev/ps3dev/releases/download/$(SDK_RELEASE)/$(SDK_ASSET)
+SDK_TAR		:= $(SDK_ASSET)
 
 -include $(PS3DEV)/ppu_rules
 
+# Use absolute tool paths so local SDK builds do not depend on the caller's PATH.
+CC		:= $(PS3DEV)/ppu/bin/ppu-gcc
+
 TARGET		:= moonlight-ps3
 BUILD		:= build
-OFILES		:= src/main.o src/ui.o src/video/ps3.o src/ps3_compat.o src/openssl_compat.o src/connection.o src/input/ps3.o src/audio/ps3.o src/handshake.o
+OFILES		:= src/main.o src/ui.o src/video/ps3.o src/ps3_compat.o src/random.o src/net_logger.o src/openssl_compat.o src/connection.o src/input/ps3.o src/audio/ps3.o src/handshake.o
 # Enable Cell Broadband Engine CPU optimizations for the PowerPC Processing Unit (PPU)
-CFLAGS		+= -mcpu=cell -O2 -Wall -I$(PS3DEV)/ppu/include -I$(PS3DEV)/portlibs/ppu/include -I./src -I./src/video -I./third_party/moonlight-common-c/src -I./third_party/opus/include -include src/openssl_compat.h -fno-lto
+CFLAGS		+= -mcpu=cell -O2 -Wall -Wextra -MMD -MP -I$(PS3DEV)/ppu/include -I$(PS3DEV)/portlibs/ppu/include -I./src -I./src/video -I./third_party/moonlight-common-c/src -I./third_party/opus/include -include src/openssl_compat.h -fno-lto
 LDFLAGS     += -fno-lto
 # Link with polarssl for client-side cryptography. The moonlight-common-c
 # submodule expects mbedtls, but we emulate it via src/openssl_compat.c
@@ -42,6 +59,8 @@ $(LIBOPUS): FORCE
 $(TARGET).elf: $(OFILES) $(LIBCOMMON) $(LIBOPUS)
 	$(CC) $(OFILES) $(LDFLAGS) $(LIBS) -o $@
 
+-include $(OFILES:.o=.d)
+
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -62,14 +81,16 @@ pkg: $(TARGET).elf
 
 clean:
 	@echo "Cleaning build artifacts and temporary files..."
-	gio trash $(OFILES) $(TARGET).elf $(TARGET).self $(TARGET).fake.self $(BUILD)/ $(TARGET).pkg $(TARGET).gnpdrm.pkg 2>/dev/null || true
+	rm -f $(OFILES) $(OFILES:.o=.d) $(TARGET).elf $(TARGET).self $(TARGET).fake.self $(TARGET).pkg $(TARGET).gnpdrm.pkg
+	rm -rf $(BUILD)
 	# Clean third_party submodules using absolute paths
 	$(MAKE) -C third_party/moonlight-common-c -f Makefile.ps3 clean CC=$(abspath $(PS3DEV))/ppu/bin/ppu-gcc AR=$(abspath $(PS3DEV))/ppu/bin/ppu-ar 2>/dev/null || true
 	$(MAKE) -C third_party/opus -f Makefile.unix clean 2>/dev/null || true
 
 prepare:
 	@echo "Downloading PS3 SDK from $(SDK_URL)..."
-	curl -L -o $(SDK_TAR) $(SDK_URL)
+	curl --fail --location --output $(SDK_TAR).tmp $(SDK_URL)
+	mv $(SDK_TAR).tmp $(SDK_TAR)
 	@echo "Extracting PS3 SDK to project directory..."
 	tar -xzf $(SDK_TAR) -C .
 	@echo "Cleaning up archive..."

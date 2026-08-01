@@ -21,6 +21,7 @@ const char* ui_get_target_ip();
 int ui_get_width();
 int ui_get_height();
 void ui_stop();
+void ui_shutdown();
 int ui_get_vsync();
 int ui_get_show_stats();
 int ui_get_verbose();

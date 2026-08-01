@@ -2,6 +2,22 @@
 
 All notable changes to the Moonlight PS3 project will be documented in this file.
 
+## Unreleased
+
+### Security and reliability
+
+- Use the PS3 system random-number service for credentials, UUIDs, pairing data, and stream input keys.
+- Generate a fresh pairing PIN and pin each paired host's TLS certificate fingerprint.
+- Validate HTTP status, response sizes, allocations, and pairing hex payloads before processing them.
+- Make controller input startup idempotent and keep the UI controller service alive across reconnects.
+- Reset VDEC queues and release RSX mappings on teardown and partial initialization failures.
+- Disable UDP broadcast logging by default and centralize logger ownership and shutdown.
+
+### Build
+
+- Select the official ps3dev SDK archive for macOS ARM64, macOS x64, or Linux x64 automatically.
+- Use absolute compiler paths and generate header dependency files for incremental builds.
+
 ## [v1.0.0] - 2026-08-01 - Initial Release
 
 ### Features & Highlights

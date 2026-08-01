@@ -19,6 +19,8 @@
 #include "connection.h"
 #include "handshake.h"
 #include "net_logger.h"
+#include "random.h"
+#include "ui.h"
 #include "video/ps3.h"
 #include "input/ps3.h"
 
@@ -28,6 +30,8 @@ SYS_PROCESS_PARAM(1001, 0x100000)
 // static void pump_sysutil() { sysUtilCheckCallback(); }
 
 static void sysutil_exit_callback(u64 status, u64 param, void *usrdata) {
+  (void)param;
+  (void)usrdata;
   if (status == SYSUTIL_EXIT_GAME) {
     NLOG("SYSUTIL_EXIT_GAME received. Exiting Moonlight PS3...");
     ui_stop();
@@ -35,6 +39,8 @@ static void sysutil_exit_callback(u64 status, u64 param, void *usrdata) {
 }
 
 int main(int argc, char **argv) {
+  (void)argc;
+  (void)argv;
   // Ağı başlat
   // Ağı başlat
   sysModuleLoad(SYSMODULE_NET);
@@ -75,7 +81,7 @@ int main(int argc, char **argv) {
 
       // Handshake
       NLOG("H: Initializing Handshake...");
-      handshake_info_t hinfo;
+      handshake_info_t hinfo = {0};
       if (hv_init(&hinfo, pcIp) != 0) {
         if (ui_get_state() == UI_STATE_IP_ENTRY) continue;
         NLOG("H: hv_init failed!");
@@ -83,7 +89,14 @@ int main(int argc, char **argv) {
         continue;
       }
 
-      char pin[5] = "0000";
+      uint32_t random_value;
+      char pin[5];
+      if (ps3_random_u32(&random_value) != 0) {
+        NLOG("H: Secure random number generation failed.");
+        ui_set_state(UI_STATE_ERROR);
+        continue;
+      }
+      snprintf(pin, sizeof(pin), "%04u", (unsigned int)(random_value % 10000));
       int paired = hv_is_paired(&hinfo);
       if (ui_get_state() == UI_STATE_IP_ENTRY) continue;
       
@@ -115,10 +128,15 @@ int main(int argc, char **argv) {
 
       unsigned char rikey_bin[16];
       char rikey_hex[33];
-      for (int i = 0; i < 16; i++) rikey_bin[i] = rand() % 256;
+      if (ps3_random_bytes(rikey_bin, sizeof(rikey_bin)) != 0 ||
+          ps3_random_u32(&random_value) != 0) {
+        NLOG("H: Failed to generate secure session keys.");
+        ui_set_state(UI_STATE_ERROR);
+        continue;
+      }
       for (int i = 0; i < 16; i++) sprintf(rikey_hex + (i * 2), "%02X", rikey_bin[i]);
       rikey_hex[32] = '\0';
-      int rikeyid = rand() % 1000000;
+      int rikeyid = (int)(random_value % 1000000);
 
       NLOG("H: Fetching app list...");
       int app_id = hv_get_first_appid(&hinfo);
@@ -163,7 +181,7 @@ int main(int argc, char **argv) {
 
       int ret = LiStartConnection(&server, &streamConfig, &connection_callbacks,
                                   &decoder_callbacks_ps3, &audio_callbacks_ps3,
-                                  NULL, 0, NULL, (int)hinfo.connect_data);
+                                  NULL, 0, NULL, 0);
       
       if (ret == 0) {
         NLOG("Connection Start initiated. Waiting for stream...");
@@ -212,5 +230,12 @@ int main(int argc, char **argv) {
     usleep(50000);
   }
 
+  ui_shutdown();
+  ps3input_stop();
+  net_logger_shutdown();
+  sysUtilUnregisterCallback(0);
+  netCtlTerm();
+  netDeinitialize();
+  sysModuleUnload(SYSMODULE_NET);
   return 0;
 }

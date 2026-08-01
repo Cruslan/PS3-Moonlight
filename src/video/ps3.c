@@ -54,6 +54,9 @@ static int mutex_initialized = 0;
 
 static u32 vdec_handle = 0;
 static void *vdec_mem_addr = NULL;
+static int vdec_opened = 0;
+static int vdec_sequence_started = 0;
+static int vdec_module_owned = 0;
 
 // Ping-pong bitstream buffers: one is submitted to VDEC ("back"),
 // the other is filled by the network thread ("front").
@@ -61,6 +64,7 @@ static void *vdec_mem_addr = NULL;
 // buffer that is being written or realloc'd.
 #define VDEC_BUF_COUNT 4
 #define VDEC_DECODE_BUF_INITIAL (512 * 1024)
+#define VDEC_DECODE_BUF_MAX (4 * 1024 * 1024)
 static u8  *vdec_buf[VDEC_BUF_COUNT]   = {NULL, NULL, NULL, NULL};
 static u32  vdec_buf_size[VDEC_BUF_COUNT] = {0, 0, 0, 0};
 static int  vdec_front    = 0; // index we fill
@@ -80,6 +84,7 @@ static volatile int vdec_picout_pending = 0;
 
 // RSX render target — mapped from system RAM (zero-copy: VDEC writes here, RSX reads directly)
 static u32 video_texture_rsx_offsets[VDEC_FRAME_COUNT] = {0, 0, 0, 0};  // RSX offsets of vdec_frame_bufs
+static int video_texture_mapped[VDEC_FRAME_COUNT] = {0, 0, 0, 0};
 
 static int video_width = 1280;
 static int video_height = 720;
@@ -92,6 +97,79 @@ static int ready_count = 0;
 
 static volatile int vdec_au_pending  = 0; // count of AUs in hardware queue
 static volatile int vdec_seq_done    = 0; // set by SEQDONE callback
+
+static void reset_video_runtime_state(void) {
+  front_buf = -1;
+  write_buf = 0;
+  ready_head = 0;
+  ready_tail = 0;
+  ready_count = 0;
+  vdec_front = 0;
+  vdec_back = 0;
+  vdec_au_pending = 0;
+  vdec_picout_pending = 0;
+  vdec_seq_done = 0;
+  submit_head = 0;
+  submit_tail = 0;
+  submit_count = 0;
+  decode_latency_sum = 0;
+  decode_latency_count = 0;
+  render_latency_sum = 0;
+  render_latency_count = 0;
+  current_decode_latency_ms = 0;
+  current_render_latency_ms = 0;
+  current_net_latency_ms = 0;
+  frames_this_second = 0;
+  decoded_frames_this_second = 0;
+  current_video_fps = 0;
+  current_decoded_fps = 0;
+  last_fps_time = 0;
+}
+
+static void release_video_resources(void) {
+  if (mutex_initialized) {
+    sysMutexDestroy(frame_mutex);
+    mutex_initialized = 0;
+  }
+
+  if (vdec_sequence_started) {
+    vdec_seq_done = 0;
+    vdecEndSequence(vdec_handle);
+    int timeout = 2000;
+    while (!vdec_seq_done && timeout-- > 0) usleep(100);
+    vdec_sequence_started = 0;
+  }
+  if (vdec_opened) {
+    vdecClose(vdec_handle);
+    vdec_opened = 0;
+    vdec_handle = 0;
+  }
+
+  if (vdec_mem_addr) {
+    free(vdec_mem_addr);
+    vdec_mem_addr = NULL;
+  }
+  for (int bi = 0; bi < VDEC_BUF_COUNT; bi++) {
+    free(vdec_buf[bi]);
+    vdec_buf[bi] = NULL;
+    vdec_buf_size[bi] = 0;
+  }
+  for (int i = 0; i < VDEC_FRAME_COUNT; i++) {
+    if (video_texture_mapped[i]) {
+      gcmUnmapEaIoAddress(vdec_frame_bufs[i]);
+      video_texture_mapped[i] = 0;
+    }
+    video_texture_rsx_offsets[i] = 0;
+    free(vdec_frame_bufs[i]);
+    vdec_frame_bufs[i] = NULL;
+  }
+  if (vdec_module_owned) {
+    sysModuleUnload(SYSMODULE_VDEC);
+    vdec_module_owned = 0;
+  }
+
+  reset_video_runtime_state();
+}
 
 // vdec_callback: runs on RPCS3's internal HLE thread.
 // CRITICAL: must NOT make any PS3/LV2 API calls here (causes reentrant crash).
@@ -208,13 +286,19 @@ void vdec_poll(void) {
 
 static int ps3_video_setup(int videoFormat, int width, int height,
                            int redrawRate, void *context, int drFlags) {
+  (void)videoFormat;
+  (void)context;
+  (void)drFlags;
   printf("PS3 Video Setup: %dx%d @ %d fps\n", width, height, redrawRate);
+  reset_video_runtime_state();
 
   // Load VDEC base module. H264 codec support is built into the main VDEC
   // module on real PS3 hardware. SYSMODULE_VDEC_H264 is a separate SPU firmware
   // module that VDEC loads internally — we must NOT manually load it.
   s32 mod_rc = sysModuleLoad(SYSMODULE_VDEC);
-  if (mod_rc != 0) {
+  if (mod_rc == 0) {
+    vdec_module_owned = 1;
+  } else {
     printf(
         "sysModuleLoad(SYSMODULE_VDEC) returned %d (may already be loaded)\n",
         mod_rc);
@@ -245,8 +329,7 @@ static int ps3_video_setup(int videoFormat, int width, int height,
   closure.fn = __build_opd32(vdec_callback, &vdec_callback_opd);
   closure.arg = (u32)0;
 
-  int opened = 0;
-  for (int mi = 0; mi < 4 && !opened; mi++) {
+  for (int mi = 0; mi < 4 && !vdec_opened; mi++) {
     u32 mem_bytes = mem_sizes[mi] * 1024 * 1024;
     if (vdec_mem_addr) {
       free(vdec_mem_addr);
@@ -260,13 +343,13 @@ static int ps3_video_setup(int videoFormat, int width, int height,
     config.mem_addr = (u32)(uintptr_t)vdec_mem_addr;
     config.mem_size = mem_bytes;
 
-    for (int li = 0; li < 5 && !opened; li++) {
+    for (int li = 0; li < 5 && !vdec_opened; li++) {
       type.profile_level = profile_levels[li];
       int rc = vdecOpen(&type, &config, &closure, &vdec_handle);
       if (rc == 0) {
         printf("vdecOpen OK: profile_level=%u, mem=%uMB\n", profile_levels[li],
                mem_sizes[mi]);
-        opened = 1;
+        vdec_opened = 1;
       } else {
         printf("vdecOpen failed: profile_level=%u, mem=%uMB, rc=0x%x\n",
                profile_levels[li], mem_sizes[mi], rc);
@@ -274,21 +357,32 @@ static int ps3_video_setup(int videoFormat, int width, int height,
     }
   }
 
-  if (!opened) {
+  if (!vdec_opened) {
     printf("All vdecOpen attempts failed — no H264 decoder available.\n");
     if (vdec_mem_addr) {
       free(vdec_mem_addr);
       vdec_mem_addr = NULL;
     }
+    release_video_resources();
     return -1;
   }
 
-  vdecStartSequence(vdec_handle);
+  if (vdecStartSequence(vdec_handle) != 0) {
+    printf("vdecStartSequence failed\n");
+    release_video_resources();
+    return -1;
+  }
+  vdec_sequence_started = 1;
 
   // Allocate all buffers.
   for (int bi = 0; bi < VDEC_BUF_COUNT; bi++) {
     if (!vdec_buf[bi]) {
       vdec_buf[bi] = memalign(128, VDEC_DECODE_BUF_INITIAL);
+      if (!vdec_buf[bi]) {
+        printf("Failed to allocate VDEC input buffer %d\n", bi);
+        release_video_resources();
+        return -1;
+      }
       vdec_buf_size[bi] = VDEC_DECODE_BUF_INITIAL;
     }
   }
@@ -309,10 +403,7 @@ static int ps3_video_setup(int videoFormat, int width, int height,
           vdec_frame_bufs[i] = memalign(1024 * 1024, align_size);
           if (!vdec_frame_bufs[i]) {
               printf("Failed to alloc vdec_frame_bufs[%d] (%u bytes)\n", i, align_size);
-              vdecEndSequence(vdec_handle);
-              vdecClose(vdec_handle);
-              free(vdec_mem_addr);
-              vdec_mem_addr = NULL;
+              release_video_resources();
               return -1;
           }
           memset(vdec_frame_bufs[i], 0, align_size);
@@ -321,9 +412,11 @@ static int ps3_video_setup(int videoFormat, int width, int height,
 
           s32 map_rc = gcmMapMainMemory(vdec_frame_bufs[i], align_size, &video_texture_rsx_offsets[i]);
           if (map_rc != 0) {
-              printf("gcmMapMainMemory failed: 0x%x — video disabled\n", map_rc);
-              video_texture_rsx_offsets[i] = 0;
+              printf("gcmMapMainMemory failed: 0x%x\n", map_rc);
+              release_video_resources();
+              return -1;
           } else {
+              video_texture_mapped[i] = 1;
               printf("vdec_frame_bufs[%d] mapped to RSX offset: 0x%x\n", i, video_texture_rsx_offsets[i]);
           }
       }
@@ -339,6 +432,8 @@ static int ps3_video_setup(int videoFormat, int width, int height,
       printf("frame_mutex initialized\n");
   } else {
       printf("Failed to initialize frame_mutex\n");
+      release_video_resources();
+      return -1;
   }
 
   // Set GCM flip mode: VSYNC (Default) or HSYNC (Immediate Flip / VSync OFF) based on UI settings
@@ -360,40 +455,14 @@ static void ps3_video_cleanup() {
   ps3video_stop();
   usleep(32000); // Wait 2 frames to ensure main thread exits ps3video_draw
 
-  if (mutex_initialized) {
-      sysMutexDestroy(frame_mutex);
-      mutex_initialized = 0;
-  }
-
-  // End VDEC sequence and wait for async SEQDONE before closing.
-  vdec_seq_done = 0;
-  vdecEndSequence(vdec_handle);
-  {
-    int t = 2000;
-    while (!vdec_seq_done && t-- > 0) usleep(100);
-  }
-  vdecClose(vdec_handle);
-  if (vdec_mem_addr) {
-    free(vdec_mem_addr);
-    vdec_mem_addr = NULL;
-  }
-  for (int bi = 0; bi < VDEC_BUF_COUNT; bi++) {
-    if (vdec_buf[bi]) {
-      free(vdec_buf[bi]);
-      vdec_buf[bi] = NULL;
-      vdec_buf_size[bi] = 0;
-    }
-  }
-  for (int i = 0; i < VDEC_FRAME_COUNT; i++) {
-      if (vdec_frame_bufs[i]) {
-          free(vdec_frame_bufs[i]);
-          vdec_frame_bufs[i] = NULL;
-      }
-  }
-  sysModuleUnload(SYSMODULE_VDEC);
+  release_video_resources();
 }
 
 static int ps3_video_submit_decode_unit(PDECODE_UNIT decodeUnit) {
+  if (!decodeUnit || decodeUnit->fullLength <= 0 ||
+      (u32)decodeUnit->fullLength > VDEC_DECODE_BUF_MAX) {
+    return DR_OK;
+  }
   // Non-blocking check: if VDEC hardware queue is full, drop this frame
   // immediately.  We must NEVER block here because in queue-based mode the
   // decoder thread must stay responsive to keep draining the decode unit
@@ -423,12 +492,13 @@ static int ps3_video_submit_decode_unit(PDECODE_UNIT decodeUnit) {
   u32 length = 0;
   PLENTRY entry = decodeUnit->bufferList;
   while (entry != NULL) {
-    if (length + entry->length <= vdec_decode_buffer_size) {
-      memcpy(vdec_decode_buffer + length, entry->data, entry->length);
-      length += entry->length;
-    }
+    if (!entry->data || (u32)entry->length > vdec_decode_buffer_size - length)
+      return DR_OK;
+    memcpy(vdec_decode_buffer + length, entry->data, entry->length);
+    length += entry->length;
     entry = entry->next;
   }
+  if (length == 0 || length != (u32)decodeUnit->fullLength) return DR_OK;
 
   // Step 2: Convert from AVCC (length-prefixed) to Annex B (start-code prefixed)
   // if necessary, handling multi-NALU packets correctly.
@@ -474,6 +544,10 @@ static int ps3_video_submit_decode_unit(PDECODE_UNIT decodeUnit) {
           memcpy(vdec_decode_buffer, start_code, 4);
           length += 4;
         }
+      } else if (pos != length) {
+        // A partially valid AVCC frame must not be submitted after mutating
+        // only some NAL length fields into Annex B start codes.
+        return DR_OK;
       }
     }
   }
@@ -514,7 +588,11 @@ static int ps3_video_submit_decode_unit(PDECODE_UNIT decodeUnit) {
   if (ui_get_show_stats()) {
       submit_queue[submit_head] = sysGetSystemTime();
       submit_head = (submit_head + 1) % SUBMIT_QUEUE_SIZE;
-      submit_count++;
+      if (submit_count < SUBMIT_QUEUE_SIZE) {
+          submit_count++;
+      } else {
+          submit_tail = (submit_tail + 1) % SUBMIT_QUEUE_SIZE;
+      }
   }
 
   vdec_back = vdec_front;

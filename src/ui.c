@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <sys/thread.h>
+#include <sys/mutex.h>
 #include <unistd.h>
 #include <lv2/systime.h>
 #include "input/ps3.h"
@@ -13,10 +14,11 @@
 #include "audio/ps3.h"
 
 static sys_ppu_thread_t ui_thread;
-static int ui_running = 1;
+static int ui_thread_started = 0;
+static volatile int ui_running = 1;
 static int ui_width = 1280;
 static int ui_height = 720;
-static int ui_state = UI_STATE_IP_ENTRY;
+static volatile int ui_state = UI_STATE_IP_ENTRY;
 
 // IP state
 static int ip_octets[4] = {192, 168, 1, 1};
@@ -57,8 +59,9 @@ static void ui_loop(void *arg);
 #define MAX_LOG_WIDTH 100
 
 static char log_buffer[MAX_LOG_LINES][MAX_LOG_WIDTH];
-static int log_head = 0;
 static int log_count = 0;
+static sys_mutex_t log_mutex;
+static int log_mutex_initialized = 0;
 
 // Simple 8x8 font bitmap (MSX style) - subset (32-127)
 // This is a minimal fallback to avoid external dependencies
@@ -179,10 +182,23 @@ void ui_init(int width, int height) {
     SetFontSize(16, 16);  // Proportional font sizing
     SetFontColor(0xffffffff, 0x00000000); // White on transparent
     
-    sysThreadCreate(&ui_thread, ui_loop, 0, 500, 0x4000, THREAD_JOINABLE, "UI Thread");
+    sys_mutex_attr_t attr;
+    sysMutexAttrInitialize(attr);
+    if (sysMutexCreate(&log_mutex, &attr) == 0) {
+        log_mutex_initialized = 1;
+    }
+
+    if (sysThreadCreate(&ui_thread, ui_loop, 0, 500, 0x4000,
+                        THREAD_JOINABLE, "UI Thread") == 0) {
+        ui_thread_started = 1;
+    } else {
+        ui_running = 0;
+    }
 }
 
 void ui_push_log(const char *msg) {
+    if (!msg) return;
+    if (log_mutex_initialized) sysMutexLock(log_mutex, 0);
     if (log_count < MAX_LOG_LINES) {
         strncpy(log_buffer[log_count], msg, MAX_LOG_WIDTH - 1);
         log_buffer[log_count][MAX_LOG_WIDTH - 1] = '\0';
@@ -195,6 +211,7 @@ void ui_push_log(const char *msg) {
         strncpy(log_buffer[MAX_LOG_LINES - 1], msg, MAX_LOG_WIDTH - 1);
         log_buffer[MAX_LOG_LINES - 1][MAX_LOG_WIDTH - 1] = '\0';
     }
+    if (log_mutex_initialized) sysMutexUnlock(log_mutex);
 }
 
 static void draw_background_gradient() {
@@ -220,6 +237,7 @@ static void draw_background_gradient() {
 }
 
 static void ui_loop(void *arg) {
+    (void)arg;
     ps3_pad_state_t pad;
     
     while (ui_running) {
@@ -413,6 +431,16 @@ static void ui_loop(void *arg) {
 
         // 2. Draw TTY Logs (Bottom 30%) - Only in Menus
         if (ui_state != UI_STATE_STREAMING) {
+            char visible_logs[8][MAX_LOG_WIDTH];
+            int visible_log_count = 0;
+
+            if (log_mutex_initialized) sysMutexLock(log_mutex, 0);
+            int start_line = (log_count > 8) ? (log_count - 8) : 0;
+            for (int i = start_line; i < log_count; i++) {
+                memcpy(visible_logs[visible_log_count++], log_buffer[i], MAX_LOG_WIDTH);
+            }
+            if (log_mutex_initialized) sysMutexUnlock(log_mutex);
+
             tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
             tiny3d_VertexPos(0, ui_height * 0.7f, 65535);
             tiny3d_VertexFcolor(0.0f, 0.0f, 0.0f, 0.8f);
@@ -426,9 +454,8 @@ static void ui_loop(void *arg) {
 
             SetFontSize(16, 16);
             SetFontColor(0xff00ff00, 0); // Neo-Matrix green for debug logs
-            int start_line = (log_count > 8) ? (log_count - 8) : 0;
-            for (int i = start_line; i < log_count; i++) {
-                DrawString(20, ui_height * 0.71f + ((i - start_line) * 20), log_buffer[i]);
+            for (int i = 0; i < visible_log_count; i++) {
+                DrawString(20, ui_height * 0.71f + (i * 20), visible_logs[i]);
             }
         }
 
@@ -436,4 +463,17 @@ static void ui_loop(void *arg) {
         // tiny3d_Flip() waits for VBlank, so usleep is unnecessary and causes frame drops.
     }
     sysThreadExit(0);
+}
+
+void ui_shutdown() {
+    ui_stop();
+    if (ui_thread_started) {
+        u64 retval;
+        sysThreadJoin(ui_thread, &retval);
+        ui_thread_started = 0;
+    }
+    if (log_mutex_initialized) {
+        sysMutexDestroy(log_mutex);
+        log_mutex_initialized = 0;
+    }
 }

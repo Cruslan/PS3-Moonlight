@@ -15,7 +15,7 @@ Moonlight PS3 is an open-source PlayStation 3 homebrew client for NVIDIA GameStr
 
 ## Prerequisites
 
-- **PS3 Toolchain**: `ps3dev` / PSL1GHT PPU toolchain (`ppu-gcc`, `make_self_npdrm`, `sprxlinker`, `pkg`). Automatically installed via `make prepare`.
+- **PS3 Toolchain**: `ps3dev` / PSL1GHT PPU toolchain (`ppu-gcc`, `make_self_npdrm`, `sprxlinker`, `pkg`). Automatically installed via `make prepare` on macOS ARM64, macOS x64, and Linux x64 hosts.
 
 ## Quick Start & Building from Source
 
@@ -48,7 +48,9 @@ Moonlight PS3 is an open-source PlayStation 3 homebrew client for NVIDIA GameStr
 2. Ensure your host PC running Sunshine or NVIDIA GameStream is connected to the same local network.
 3. Launch Moonlight PS3.
 4. Set your host PC IP address.
-5. When pairing with Sunshine / GameStream, enter the default client pairing PIN: **`0000`**.
+5. Enter the randomly generated four-digit PIN shown in the Moonlight PS3 log panel into Sunshine / GameStream.
+
+The paired server certificate is pinned per host. Existing installations upgrading from an older build must pair once more to create the host certificate fingerprint.
 
 ## Credits
 

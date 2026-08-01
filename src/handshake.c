@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <ctype.h>
 #include <string.h>
 #include <malloc.h>
 #include <unistd.h>
@@ -13,22 +14,24 @@
 #include <polarssl/sha256.h>
 #include <polarssl/aes.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <errno.h>
-#include <sys/time.h>
 #include "uuid.h"
 #include "net_logger.h"
 #include "handshake.h"
 #include "ui.h"
+#include "random.h"
 #include <net/poll.h>
 
 static void bin_to_hex(const unsigned char *bin, size_t len, char *out);
 
 #define SUNSHINE_HTTPS_PORT 47984
 #define SUNSHINE_HTTP_PORT  47989
+#define MAX_HTTP_RESPONSE_SIZE (1024 * 1024)
 
 static int connect_with_cancel(int fd, const struct sockaddr *addr, socklen_t addrlen) {
     int nbio = 1;
@@ -88,23 +91,106 @@ struct string {
 
 static void init_string(struct string *s) {
     s->len = 0;
-    s->ptr = malloc(s->len + 1);
-    s->ptr[0] = '\0';
+    s->ptr = NULL;
+}
+
+static void reset_string(struct string *s) {
+    free(s->ptr);
+    init_string(s);
+}
+
+static int append_string(struct string *s, const void *data, size_t length) {
+    if (length > MAX_HTTP_RESPONSE_SIZE - s->len) return -1;
+
+    size_t new_len = s->len + length;
+    char *new_ptr = realloc(s->ptr, new_len + 1);
+    if (!new_ptr) return -1;
+
+    s->ptr = new_ptr;
+    memcpy(s->ptr + s->len, data, length);
+    s->len = new_len;
+    s->ptr[new_len] = '\0';
+    return 0;
+}
+
+static int http_response_ok(const struct string *response) {
+    int status = 0;
+    return response->ptr &&
+           sscanf(response->ptr, "HTTP/%*u.%*u %d", &status) == 1 &&
+           status >= 200 && status < 300;
+}
+
+static int generate_uuid_string(char output[37]) {
+    uuid_t uuid;
+    if (ps3_random_bytes(uuid, sizeof(uuid)) != 0) return -1;
+    uuid[6] = (uuid[6] & 0x0F) | 0x40;
+    uuid[8] = (uuid[8] & 0x3F) | 0x80;
+    uuid_unparse(uuid, output);
+    return 0;
+}
+
+static int uuid_string_valid(const char *value) {
+    if (!value || strlen(value) != 36) return 0;
+
+    for (size_t i = 0; i < 36; i++) {
+        if (i == 8 || i == 13 || i == 18 || i == 23) {
+            if (value[i] != '-') return 0;
+        } else if (!isxdigit((unsigned char)value[i])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int certificate_fingerprint(const x509_crt *certificate,
+                                   unsigned char output[32]) {
+    if (!certificate || !certificate->raw.p || certificate->raw.len == 0) return -1;
+    sha256(certificate->raw.p, certificate->raw.len, output, 0);
+    return 0;
+}
+
+static int save_server_fingerprint(const handshake_info_t *info,
+                                   const x509_crt *certificate) {
+    unsigned char fingerprint[32];
+    char temporary_path[sizeof(info->server_cert_hash_path) + 5];
+
+    if (certificate_fingerprint(certificate, fingerprint) != 0) return -1;
+    if (snprintf(temporary_path, sizeof(temporary_path), "%s.tmp",
+                 info->server_cert_hash_path) >= (int)sizeof(temporary_path)) return -1;
+
+    FILE *file = fopen(temporary_path, "wb");
+    if (!file) return -1;
+    int ok = fwrite(fingerprint, 1, sizeof(fingerprint), file) == sizeof(fingerprint);
+    if (fclose(file) != 0) ok = 0;
+    if (!ok || rename(temporary_path, info->server_cert_hash_path) != 0) {
+        unlink(temporary_path);
+        return -1;
+    }
+    return 0;
+}
+
+static int verify_server_fingerprint(const handshake_info_t *info,
+                                     const x509_crt *certificate) {
+    unsigned char actual[32];
+    unsigned char expected[32];
+    unsigned char difference = 0;
+
+    if (certificate_fingerprint(certificate, actual) != 0) return -1;
+
+    FILE *file = fopen(info->server_cert_hash_path, "rb");
+    if (!file) return -1;
+    size_t length = fread(expected, 1, sizeof(expected), file);
+    int trailing = fgetc(file);
+    fclose(file);
+    if (length != sizeof(expected) || trailing != EOF) return -1;
+
+    for (size_t i = 0; i < sizeof(expected); i++) difference |= actual[i] ^ expected[i];
+    return difference == 0 ? 0 : -1;
 }
 
 static int hv_entropy_func(void *data, unsigned char *output, size_t len) {
     (void)data;
-    static int seeded = 0;
-    if (!seeded) {
-        // High-resolution seed using time, clock and a constant for PS3
-        srand(time(NULL) ^ (clock() << 8) ^ 0xACE12345);
-        for(int i=0; i<100; i++) rand(); // Warm up PRNG
-        seeded = 1;
-    }
-    for (size_t i = 0; i < len; i++) {
-        output[i] = (unsigned char)(rand() % 256 ^ (clock() & 0xFF));
-    }
-    return 0;
+    return ps3_random_bytes(output, len);
 }
 
 static const int ps3_ciphers[] = {
@@ -126,28 +212,37 @@ static void ps3_ssl_debug(void *ctx, int level, const char *str) {
     (void)level;
     // Redirect PolarSSL internal debug to our NLOG
     char log_str[1024];
-    strncpy(log_str, str, sizeof(log_str));
-    if (log_str[strlen(log_str)-1] == '\n') log_str[strlen(log_str)-1] = '\0';
+    if (!str) return;
+    strncpy(log_str, str, sizeof(log_str) - 1);
+    log_str[sizeof(log_str) - 1] = '\0';
+    size_t len = strlen(log_str);
+    if (len > 0 && log_str[len - 1] == '\n') log_str[len - 1] = '\0';
     NLOG("[SSL] %s", log_str);
 }
 
 // Custom HTTPS request using PolarSSL directly
 static int ps3_https_request(handshake_info_t *info, const char *url_path, struct string *response) {
-    int ret, fd = -1;
+    int ret = 0;
+    int fd = -1;
+    int result = -1;
+    int ssl_initialized = 0;
     ssl_context ssl;
-    ssl_session ssn;
     entropy_context entropy;
     ctr_drbg_context ctr_drbg;
     x509_crt clicert;
     pk_context pkey;
-    
-    // Initialize structures
+
+    init_string(response);
     memset(&ssl, 0, sizeof(ssl_context));
-    memset(&ssn, 0, sizeof(ssl_session));
     x509_crt_init(&clicert);
     pk_init(&pkey);
     entropy_init(&entropy);
-    ctr_drbg_init(&ctr_drbg, hv_entropy_func, NULL, NULL, 0);
+    memset(&ctr_drbg, 0, sizeof(ctr_drbg));
+
+    if (ctr_drbg_init(&ctr_drbg, hv_entropy_func, NULL, NULL, 0) != 0) {
+        NLOG("Failed to initialize TLS random generator");
+        goto cleanup;
+    }
 
     debug_set_threshold(ui_get_verbose() ? 4 : 0);
 
@@ -155,7 +250,7 @@ static int ps3_https_request(handshake_info_t *info, const char *url_path, struc
     if (x509_crt_parse_file(&clicert, info->client_cert_path) != 0 ||
         pk_parse_keyfile(&pkey, info->client_key_path, NULL) != 0) {
         NLOG("Failed to load cert/key for SSL connection");
-        return -1;
+        goto cleanup;
     }
 
     // Connect using standard sockets
@@ -168,7 +263,7 @@ static int ps3_https_request(handshake_info_t *info, const char *url_path, struc
     fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         NLOG("socket creation failed: %d", errno);
-        return -1;
+        goto cleanup;
     }
 
     memset(&serv_addr, 0, sizeof(serv_addr));
@@ -176,7 +271,7 @@ static int ps3_https_request(handshake_info_t *info, const char *url_path, struc
     serv_addr.sin_port = htons(SUNSHINE_PORT);
     if (inet_pton(AF_INET, target_ip, &serv_addr.sin_addr) <= 0) {
         NLOG("invalid address: %s", target_ip);
-        close(fd); return -1;
+        goto cleanup;
     }
 
     struct timeval tv;
@@ -187,16 +282,19 @@ static int ps3_https_request(handshake_info_t *info, const char *url_path, struc
 
     if (connect_with_cancel(fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
         NLOG("connect failed: %d", errno);
-        close(fd); return -1;
+        goto cleanup;
     }
     NLOG("TCP Connected. Initializing SSL...");
 
     if ((ret = ssl_init(&ssl)) != 0) {
         NLOG("ssl_init failed: %d", ret);
-        close(fd); return -1;
+        goto cleanup;
     }
+    ssl_initialized = 1;
 
     ssl_set_endpoint(&ssl, SSL_IS_CLIENT);
+    // Sunshine uses a self-signed host certificate. We pin its exact DER hash
+    // after the PIN-authenticated pairing exchange and verify it below.
     ssl_set_authmode(&ssl, SSL_VERIFY_NONE);
     ssl_set_rng(&ssl, ctr_drbg_random, &ctr_drbg);
     ssl_set_bio(&ssl, net_recv, &fd, net_send, &fd);
@@ -210,62 +308,90 @@ static int ps3_https_request(handshake_info_t *info, const char *url_path, struc
     ssl_set_ciphersuites(&ssl, ps3_ciphers);
     ssl_set_renegotiation(&ssl, SSL_RENEGOTIATION_ENABLED);
     
-    // Relax TLS Versions
-    ssl_set_min_version(&ssl, SSL_MAJOR_VERSION_3, SSL_MINOR_VERSION_1); // TLS 1.0
+    // Sunshine supports TLS 1.2. Do not negotiate obsolete TLS 1.0/1.1.
+    ssl_set_min_version(&ssl, SSL_MAJOR_VERSION_3, SSL_MINOR_VERSION_3);
     ssl_set_max_version(&ssl, SSL_MAJOR_VERSION_3, SSL_MINOR_VERSION_3); // TLS 1.2
 
     NLOG("Starting SSL Handshake...");
     while ((ret = ssl_handshake(&ssl)) != 0) {
         if (ret != POLARSSL_ERR_NET_WANT_READ && ret != POLARSSL_ERR_NET_WANT_WRITE) {
             NLOG("ssl_handshake failed: -0x%x", -ret);
-            ssl_free(&ssl); net_close(fd); return -1;
+            goto cleanup;
         }
+    }
+
+    const x509_crt *peer_certificate = ssl_get_peer_cert(&ssl);
+    if (verify_server_fingerprint(info, peer_certificate) != 0) {
+        NLOG("TLS server certificate does not match the paired host");
+        goto cleanup;
     }
 
     // Construct and send GET request
     char request[4096];
-    snprintf(request, sizeof(request), 
+    int request_len = snprintf(request, sizeof(request),
         "GET %s HTTP/1.1\r\n"
         "Host: %s:%d\r\n"
         "User-Agent: Moonlight-PS3\r\n"
         "Connection: close\r\n\r\n",
         url_path, info->address, SUNSHINE_PORT);
+    if (request_len < 0 || (size_t)request_len >= sizeof(request)) {
+        NLOG("HTTPS request path is too long");
+        goto cleanup;
+    }
 
-    ssl_write(&ssl, (unsigned char*)request, strlen(request));
+    size_t written = 0;
+    while (written < (size_t)request_len) {
+        ret = ssl_write(&ssl, (unsigned char *)request + written,
+                        (size_t)request_len - written);
+        if (ret == POLARSSL_ERR_NET_WANT_READ || ret == POLARSSL_ERR_NET_WANT_WRITE) continue;
+        if (ret <= 0) {
+            NLOG("HTTPS request write failed: %d", ret);
+            goto cleanup;
+        }
+        written += (size_t)ret;
+    }
 
     // Read response
     unsigned char buf[1024];
-    init_string(response);
     while (1) {
         ret = ssl_read(&ssl, buf, sizeof(buf) - 1);
         if (ret == POLARSSL_ERR_NET_WANT_READ || ret == POLARSSL_ERR_NET_WANT_WRITE) continue;
         if (ret <= 0) break;
         
-        size_t new_len = response->len + ret;
-        response->ptr = realloc(response->ptr, new_len + 1);
-        memcpy(response->ptr + response->len, buf, ret);
-        response->len = new_len;
-        response->ptr[new_len] = '\0';
+        if (append_string(response, buf, (size_t)ret) != 0) {
+            NLOG("HTTPS response is too large or memory allocation failed");
+            goto cleanup;
+        }
     }
 
-    ssl_free(&ssl);
+    if (!http_response_ok(response)) {
+        NLOG("HTTPS server returned an invalid or unsuccessful response");
+        goto cleanup;
+    }
+
+    result = 0;
+
+cleanup:
+    if (ssl_initialized) ssl_free(&ssl);
     x509_crt_free(&clicert);
     pk_free(&pkey);
     ctr_drbg_free(&ctr_drbg);
     entropy_free(&entropy);
-    close(fd);
-
-    return 0;
+    if (fd >= 0) close(fd);
+    if (result != 0) reset_string(response);
+    return result;
 }
 
 // Plain HTTP request (no SSL) for initial pairing steps
 // Sunshine's /pair endpoint is also available on plain HTTP port 47989
 static int ps3_http_request(handshake_info_t *info, const char *url_path, struct string *response) {
-    int fd;
+    int fd = -1;
     struct sockaddr_in serv_addr;
     char request[4096];
     char buf[1024];
     int ret;
+
+    init_string(response);
 
     NLOG("[HTTP] Connecting to %s:%d (plain TCP)...", info->address, SUNSHINE_HTTP_PORT);
 
@@ -294,36 +420,54 @@ static int ps3_http_request(handshake_info_t *info, const char *url_path, struct
         close(fd); return -1;
     }
 
-    snprintf(request, sizeof(request),
+    int request_len = snprintf(request, sizeof(request),
         "GET %s HTTP/1.1\r\n"
         "Host: %s:%d\r\n"
         "User-Agent: Moonlight-PS3\r\n"
         "Connection: close\r\n\r\n",
         url_path, info->address, SUNSHINE_HTTP_PORT);
 
-    if (send(fd, request, strlen(request), 0) < 0) {
-        NLOG("[HTTP] send failed: %d", errno);
-        close(fd); return -1;
+    if (request_len < 0 || (size_t)request_len >= sizeof(request)) {
+        NLOG("[HTTP] request path is too long");
+        close(fd);
+        return -1;
     }
 
-    init_string(response);
+    size_t written = 0;
+    while (written < (size_t)request_len) {
+        ret = send(fd, request + written, (size_t)request_len - written, 0);
+        if (ret <= 0) {
+            NLOG("[HTTP] send failed: %d", errno);
+            close(fd);
+            return -1;
+        }
+        written += (size_t)ret;
+    }
+
     while (1) {
         ret = recv(fd, buf, sizeof(buf) - 1, 0);
         if (ret <= 0) break;
-        size_t new_len = response->len + ret;
-        response->ptr = realloc(response->ptr, new_len + 1);
-        memcpy(response->ptr + response->len, buf, ret);
-        response->len = new_len;
-        response->ptr[new_len] = '\0';
+        if (append_string(response, buf, (size_t)ret) != 0) {
+            NLOG("[HTTP] response is too large or memory allocation failed");
+            close(fd);
+            reset_string(response);
+            return -1;
+        }
     }
 
     close(fd);
+    if (!http_response_ok(response)) {
+        NLOG("[HTTP] server returned an invalid or unsuccessful response");
+        reset_string(response);
+        return -1;
+    }
     NLOG("[HTTP] Response (%zu bytes)", response->len);
     return 0;
 }
 
 int hv_generate_credentials(handshake_info_t *info) {
-    int ret;
+    int ret = -1;
+    int result = -1;
     pk_context key;
     ctr_drbg_context ctr_drbg;
     entropy_context entropy;
@@ -333,22 +477,23 @@ int hv_generate_credentials(handshake_info_t *info) {
     NLOG("Generating RSA 2048 key (PolarSSL DER)...");
     pk_init(&key);
     entropy_init(&entropy);
+    memset(&ctr_drbg, 0, sizeof(ctr_drbg));
     x509write_crt_init(&crt);
     mpi_init(&serial);
 
     if ((ret = ctr_drbg_init(&ctr_drbg, hv_entropy_func, NULL, NULL, 0)) != 0) {
         NLOG("ctr_drbg_init failed: %d", ret);
-        return -1;
+        goto cleanup;
     }
 
     if ((ret = pk_init_ctx(&key, pk_info_from_type(POLARSSL_PK_RSA))) != 0) {
         NLOG("pk_init_ctx failed: %d", ret);
-        return -1;
+        goto cleanup;
     }
 
     if ((ret = rsa_gen_key(pk_rsa(key), ctr_drbg_random, &ctr_drbg, 2048, 65537)) != 0) {
         NLOG("rsa_gen_key failed: %d", ret);
-        return -1;
+        goto cleanup;
     }
 
     // Write private key
@@ -356,13 +501,16 @@ int hv_generate_credentials(handshake_info_t *info) {
     if (f) {
         unsigned char buf[4096];
         ret = pk_write_key_pem(&key, buf, sizeof(buf));
-        if (ret == 0) {
-            fwrite(buf, 1, strlen((char*)buf), f);
+        if (ret != 0 ||
+            fwrite(buf, 1, strlen((char *)buf), f) != strlen((char *)buf)) {
+            NLOG("Failed to encode or write private key");
+            fclose(f);
+            goto cleanup;
         }
         fclose(f);
     } else {
         NLOG("Failed to open key file: %s", info->client_key_path);
-        return -1;
+        goto cleanup;
     }
 
     // Create self-signed cert
@@ -389,9 +537,13 @@ int hv_generate_credentials(handshake_info_t *info) {
     if (f) {
         fprintf(f, "%s", pem_buf);
         fclose(f);
+    } else {
+        NLOG("Failed to open certificate file: %s", info->client_cert_path);
+        goto cleanup;
     }
 
     NLOG("Credentials generated successfully (PEM format)!");
+    result = 0;
     
 cleanup:
     x509write_crt_free(&crt);
@@ -400,22 +552,38 @@ cleanup:
     entropy_free(&entropy);
     mpi_free(&serial);
 
-    return 0;
+    if (result != 0) {
+        unlink(info->client_key_path);
+        unlink(info->client_cert_path);
+    }
+    return result;
 }
 
 int hv_init(handshake_info_t *info, const char *address) {
-    strncpy(info->address, address, sizeof(info->address));
+    if (!info || !address) return -1;
+    memset(info, 0, sizeof(*info));
+    if (snprintf(info->address, sizeof(info->address), "%s", address) >=
+        (int)sizeof(info->address)) return -1;
     
     const char *base_path = "/dev_hdd0/game/MNLT00001/USRDIR";
-    mkdir(base_path, 0777);
+    if (mkdir(base_path, 0700) != 0 && errno != EEXIST) return -1;
     
     snprintf(info->client_cert_path, sizeof(info->client_cert_path), "%s/cert.pem", base_path);
     snprintf(info->client_key_path, sizeof(info->client_key_path), "%s/key.pem", base_path);
 
+    char host_id[sizeof(info->address)];
+    snprintf(host_id, sizeof(host_id), "%s", info->address);
+    for (size_t i = 0; host_id[i] != '\0'; i++) {
+        if (!isalnum((unsigned char)host_id[i])) host_id[i] = '_';
+    }
+    snprintf(info->server_cert_hash_path, sizeof(info->server_cert_hash_path),
+             "%s/server-%s.sha256", base_path, host_id);
+
     char id_path[256];
     snprintf(id_path, sizeof(id_path), "%s/uniqueid.dat", base_path);
     
-    FILE *f = fopen(id_path, "r");
+    int needs_new_id = 1;
+    FILE *f = fopen(id_path, "rb");
     if (f) {
         memset(info->unique_id, 0, sizeof(info->unique_id));
         size_t n = fread(info->unique_id, 1, 63, f);
@@ -430,17 +598,22 @@ int hv_init(handshake_info_t *info, const char *address) {
             }
         }
 
-        NLOG("Loaded persistent unique_id: %s", info->unique_id);
-    } else {
-        uuid_t uu;
-        uuid_generate_random(uu);
-        uuid_unparse(uu, info->unique_id);
-        f = fopen(id_path, "w");
-        if (f) {
-            fwrite(info->unique_id, 1, strlen(info->unique_id), f);
-            fclose(f);
-            NLOG("Saved new unique_id: %s", info->unique_id);
+        if (uuid_string_valid(info->unique_id)) {
+            needs_new_id = 0;
+            NLOG("Loaded persistent unique_id: %s", info->unique_id);
         }
+    }
+
+    if (needs_new_id) {
+        if (generate_uuid_string(info->unique_id) != 0) return -1;
+
+        f = fopen(id_path, "wb");
+        if (!f) return -1;
+        size_t id_length = strlen(info->unique_id);
+        int write_ok = fwrite(info->unique_id, 1, id_length, f) == id_length;
+        if (fclose(f) != 0) write_ok = 0;
+        if (!write_ok) return -1;
+        NLOG("Saved new unique_id: %s", info->unique_id);
     }
     
     // Only regenerate if credentials don't exist
@@ -466,25 +639,33 @@ static void bin_to_hex(const unsigned char *bin, size_t len, char *out) {
     out[len * 2] = '\0';
 }
 
-static void hex_to_bin(const char *hex, unsigned char *out) {
-    size_t len = strlen(hex) / 2;
-    for (size_t i = 0; i < len; i++) {
-        unsigned char high = hex[i * 2];
-        unsigned char low = hex[i * 2 + 1];
-        
-        if (high >= '0' && high <= '9') high -= '0';
-        else if (high >= 'A' && high <= 'F') high = high - 'A' + 10;
-        else if (high >= 'a' && high <= 'f') high = high - 'a' + 10;
-        
-        if (low >= '0' && low <= '9') low -= '0';
-        else if (low >= 'A' && low <= 'F') low = low - 'A' + 10;
-        else if (low >= 'a' && low <= 'f') low = low - 'a' + 10;
-        
-        out[i] = (high << 4) | low;
+static int hex_nibble(char value) {
+    if (value >= '0' && value <= '9') return value - '0';
+    if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+    if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+    return -1;
+}
+
+static int hex_to_bin_checked(const char *hex, unsigned char *out,
+                              size_t out_capacity, size_t *out_len) {
+    if (!hex || !out || !out_len) return -1;
+
+    size_t hex_len = strlen(hex);
+    if ((hex_len & 1) != 0 || hex_len / 2 > out_capacity) return -1;
+
+    for (size_t i = 0; i < hex_len / 2; i++) {
+        int high = hex_nibble(hex[i * 2]);
+        int low = hex_nibble(hex[i * 2 + 1]);
+        if (high < 0 || low < 0) return -1;
+        out[i] = (unsigned char)((high << 4) | low);
     }
+
+    *out_len = hex_len / 2;
+    return 0;
 }
 
 static char* extract_xml(const char *xml, const char *tag) {
+    if (!xml || !tag) return NULL;
     char start_tag[64], end_tag[64];
     snprintf(start_tag, sizeof(start_tag), "<%s>", tag);
     snprintf(end_tag, sizeof(end_tag), "</%s>", tag);
@@ -498,6 +679,7 @@ static char* extract_xml(const char *xml, const char *tag) {
     
     size_t len = end - start;
     char *res = malloc(len + 1);
+    if (!res) return NULL;
     memcpy(res, start, len);
     res[len] = '\0';
     return res;
@@ -505,7 +687,7 @@ static char* extract_xml(const char *xml, const char *tag) {
 
 int hv_is_paired(handshake_info_t *info) {
     char path[512];
-    struct string s;
+    struct string s = {0};
     snprintf(path, sizeof(path), "/serverinfo?uniqueid=%s", info->unique_id);
 
     NLOG("Checking pairing status via HTTPS...");
@@ -535,26 +717,23 @@ int hv_pair(handshake_info_t *info, const char *pin) {
     struct string s;
     init_string(&s);
 
-    NLOG("Starting pairing with PIN: %s", pin);
+    if (!pin || strlen(pin) != 4 || !isdigit((unsigned char)pin[0]) ||
+        !isdigit((unsigned char)pin[1]) || !isdigit((unsigned char)pin[2]) ||
+        !isdigit((unsigned char)pin[3])) {
+        NLOG("Pairing PIN must contain exactly four digits");
+        return -1;
+    }
+
+    NLOG("Starting pairing. Enter PIN %s on the host.", pin);
 
     // --- Generate random uuid (vita does this per-request, we'll use one for all HTTP steps)
     char uuid_str[40];
-    {
-        srand((unsigned int)time(NULL));
-        snprintf(uuid_str, sizeof(uuid_str),
-            "%08x-%04x-4%03x-%04x-%08x%04x",
-            rand() & 0xffffffff,
-            rand() & 0xffff,
-            rand() & 0x0fff,
-            (rand() & 0x3fff) | 0x8000,
-            rand() & 0xffffffff,
-            rand() & 0xffff);
-    }
+    if (generate_uuid_string(uuid_str) != 0) return -1;
 
     // --- Generate salt (16 random bytes -> hex)
     unsigned char salt_data[16];
     char salt_hex[33];
-    for (int i = 0; i < 16; i++) salt_data[i] = rand() & 0xff;
+    if (ps3_random_bytes(salt_data, sizeof(salt_data)) != 0) return -1;
     bin_to_hex(salt_data, 16, salt_hex);
 
     // --- Build cert_hex: vita reads PEM file BYTES and hex-encodes them directly
@@ -583,7 +762,13 @@ int hv_pair(handshake_info_t *info, const char *pin) {
     ctr_drbg_context ctr_drbg;
     pk_init(&key);
     entropy_init(&entropy);
-    ctr_drbg_init(&ctr_drbg, hv_entropy_func, NULL, NULL, 0);
+    memset(&ctr_drbg, 0, sizeof(ctr_drbg));
+    if (ctr_drbg_init(&ctr_drbg, hv_entropy_func, NULL, NULL, 0) != 0) {
+        NLOG("Failed to initialize pairing random generator");
+        pk_free(&key);
+        entropy_free(&entropy);
+        return -1;
+    }
     if (pk_parse_keyfile(&key, info->client_key_path, NULL) != 0) {
         NLOG("Failed to load private key from %s", info->client_key_path);
         pk_free(&key); entropy_free(&entropy); ctr_drbg_free(&ctr_drbg);
@@ -595,6 +780,7 @@ int hv_pair(handshake_info_t *info, const char *pin) {
     x509_crt_init(&client_cert);
     if (x509_crt_parse_file(&client_cert, info->client_cert_path) != 0) {
         NLOG("Failed to parse client cert from %s", info->client_cert_path);
+        x509_crt_free(&client_cert);
         pk_free(&key); entropy_free(&entropy); ctr_drbg_free(&ctr_drbg);
         return -1;
     }
@@ -628,20 +814,16 @@ int hv_pair(handshake_info_t *info, const char *pin) {
             NLOG("Step 1: no plaincert in response (response: %.500s)", s.ptr ? s.ptr : "empty");
             goto fail;
         }
-        size_t phlen = strlen(plaincert_hex);
-        if (phlen / 2 > sizeof(plaincert) - 1) {
-            NLOG("Step 1: plaincert too big");
+        size_t plaincert_len = 0;
+        if (hex_to_bin_checked(plaincert_hex, (unsigned char *)plaincert,
+                               sizeof(plaincert) - 1, &plaincert_len) != 0) {
+            NLOG("Step 1: invalid plaincert encoding or size");
             free(plaincert_hex);
             goto fail;
         }
-        // hex → bytes (this is the PEM text as bytes)
-        for (size_t count = 0; count < phlen; count += 2) {
-            char hex_byte[3] = {plaincert_hex[count], plaincert_hex[count+1], '\0'};
-            plaincert[count/2] = (char)(unsigned char)strtol(hex_byte, NULL, 16);
-        }
-        plaincert[phlen/2] = '\0';
+        plaincert[plaincert_len] = '\0';
         free(plaincert_hex);
-        NLOG("Step 1 OK. plaincert len=%zu", phlen/2);
+        NLOG("Step 1 OK. plaincert len=%zu", plaincert_len);
     }
 
     // Parse server cert from its PEM text (needed for verifySignature in Step 4)
@@ -670,7 +852,7 @@ int hv_pair(handshake_info_t *info, const char *pin) {
 
     // STEP 2: clientchallenge (HTTP) — retry waiting for PIN entry
     unsigned char challenge_data[16];
-    for (int i = 0; i < 16; i++) challenge_data[i] = rand() & 0xff;
+    if (ps3_random_bytes(challenge_data, sizeof(challenge_data)) != 0) goto fail_server_cert;
     unsigned char challenge_enc[16];
     {
         aes_context actx;
@@ -687,13 +869,10 @@ int hv_pair(handshake_info_t *info, const char *pin) {
 
     int paired = 0;
     for (int retry = 0; retry < 10 && !paired; retry++) {
-        free(s.ptr); init_string(&s);
+        reset_string(&s);
 
         // Regenerate uuid per request (like vita does)
-        snprintf(uuid_str, sizeof(uuid_str),
-            "%08x-%04x-4%03x-%04x-%08x%04x",
-            rand()&0xffffffff, rand()&0xffff, rand()&0x0fff,
-            (rand()&0x3fff)|0x8000, rand()&0xffffffff, rand()&0xffff);
+        if (generate_uuid_string(uuid_str) != 0) goto fail_server_cert;
 
         snprintf(path, sizeof(path),
             "/pair?uniqueid=%s&uuid=%s&devicename=PS3&updateState=1&clientchallenge=%s",
@@ -727,16 +906,15 @@ int hv_pair(handshake_info_t *info, const char *pin) {
             sleep(2); continue;
         }
 
-        size_t crlen = strlen(cr_hex);
-        if (crlen / 2 > sizeof(challenge_response_data)) {
-            NLOG("Step 2: challengeresponse too big");
-            free(cr_hex); goto fail_server_cert;
+        size_t decoded_len = 0;
+        if (hex_to_bin_checked(cr_hex, (unsigned char *)challenge_response_data,
+                               sizeof(challenge_response_data), &decoded_len) != 0 ||
+            decoded_len < 48 || (decoded_len % 16) != 0) {
+            NLOG("Step 2: invalid challengeresponse encoding or size");
+            free(cr_hex);
+            goto fail_server_cert;
         }
-        for (size_t co = 0; co < crlen; co += 2) {
-            char hb[3] = {cr_hex[co], cr_hex[co+1], '\0'};
-            challenge_response_data[co/2] = (char)(unsigned char)strtol(hb, NULL, 16);
-        }
-        challenge_response_data_len = (int)(crlen / 2);
+        challenge_response_data_len = (int)decoded_len;
         free(cr_hex);
 
         // Decrypt challengeresponse
@@ -761,13 +939,19 @@ int hv_pair(handshake_info_t *info, const char *pin) {
     // STEP 3: serverchallengeresp (HTTP)
     // challenge_response = serverNonce(16) | clientCertSig | clientSecret(16)
     unsigned char client_secret_data[16];
-    for (int i = 0; i < 16; i++) client_secret_data[i] = rand() & 0xff;
+    if (ps3_random_bytes(client_secret_data, sizeof(client_secret_data)) != 0)
+        goto fail_server_cert;
 
     {
         // serverNonce is the last 16 bytes of the decrypted challenge response (after hash_length)
         unsigned char *server_nonce = (unsigned char*)challenge_response_data + hash_length;
         int sig_len = (int)client_cert.sig.len;
         unsigned char *sig_bytes = client_cert.sig.p;
+
+        if (sig_len <= 0 || sig_len > 480 || !sig_bytes) {
+            NLOG("Step 3: invalid client certificate signature");
+            goto fail_server_cert;
+        }
 
         unsigned char challenge_response[512];
         int cr_len = 0;
@@ -788,10 +972,8 @@ int hv_pair(handshake_info_t *info, const char *pin) {
         char cr_hex[65];
         bin_to_hex(cr_hash_enc, 32, cr_hex);
 
-        free(s.ptr); init_string(&s);
-        snprintf(uuid_str, sizeof(uuid_str), "%08x-%04x-4%03x-%04x-%08x%04x",
-            rand()&0xffffffff, rand()&0xffff, rand()&0x0fff,
-            (rand()&0x3fff)|0x8000, rand()&0xffffffff, rand()&0xffff);
+        reset_string(&s);
+        if (generate_uuid_string(uuid_str) != 0) goto fail_server_cert;
         snprintf(path, sizeof(path),
             "/pair?uniqueid=%s&uuid=%s&devicename=PS3&updateState=1&serverchallengeresp=%s",
             info->unique_id, uuid_str, cr_hex);
@@ -817,10 +999,12 @@ int hv_pair(handshake_info_t *info, const char *pin) {
         if (!ps_hex) { NLOG("Step 3: no pairingsecret"); goto fail_server_cert; }
 
         unsigned char pairing_secret[272]; // 16 + 256
-        size_t pslen = strlen(ps_hex) / 2;
-        for (size_t co = 0; co < strlen(ps_hex); co += 2) {
-            char hb[3] = {ps_hex[co], ps_hex[co+1], '\0'};
-            pairing_secret[co/2] = (unsigned char)strtol(hb, NULL, 16);
+        size_t pslen = 0;
+        if (hex_to_bin_checked(ps_hex, pairing_secret, sizeof(pairing_secret),
+                               &pslen) != 0 || pslen <= 16) {
+            NLOG("Step 4: invalid pairingsecret encoding or size");
+            free(ps_hex);
+            goto fail_server_cert;
         }
         free(ps_hex);
 
@@ -849,6 +1033,10 @@ int hv_pair(handshake_info_t *info, const char *pin) {
                     ctr_drbg_random, &ctr_drbg) != 0) {
             NLOG("Step 4: failed to sign client secret"); goto fail_server_cert;
         }
+        if (client_sig_len == 0 || client_sig_len > sizeof(client_sig)) {
+            NLOG("Step 4: invalid generated client signature size");
+            goto fail_server_cert;
+        }
 
         unsigned char cps[272];
         memcpy(cps, client_secret_data, 16);
@@ -856,10 +1044,8 @@ int hv_pair(handshake_info_t *info, const char *pin) {
         char cps_hex[545];
         bin_to_hex(cps, 16 + client_sig_len, cps_hex);
 
-        free(s.ptr); init_string(&s);
-        snprintf(uuid_str, sizeof(uuid_str), "%08x-%04x-4%03x-%04x-%08x%04x",
-            rand()&0xffffffff, rand()&0xffff, rand()&0x0fff,
-            (rand()&0x3fff)|0x8000, rand()&0xffffffff, rand()&0xffff);
+        reset_string(&s);
+        if (generate_uuid_string(uuid_str) != 0) goto fail_server_cert;
         snprintf(path, sizeof(path),
             "/pair?uniqueid=%s&uuid=%s&devicename=PS3&updateState=1&clientpairingsecret=%s",
             info->unique_id, uuid_str, cps_hex);
@@ -874,14 +1060,16 @@ int hv_pair(handshake_info_t *info, const char *pin) {
         }
         free(pv);
         NLOG("Step 4 OK.");
+        if (save_server_fingerprint(info, &server_cert) != 0) {
+            NLOG("Step 4: failed to persist the paired server certificate");
+            goto fail_server_cert;
+        }
     }
 
     // STEP 5: pairchallenge (HTTPS)
     {
-        free(s.ptr); init_string(&s);
-        snprintf(uuid_str, sizeof(uuid_str), "%08x-%04x-4%03x-%04x-%08x%04x",
-            rand()&0xffffffff, rand()&0xffff, rand()&0x0fff,
-            (rand()&0x3fff)|0x8000, rand()&0xffffffff, rand()&0xffff);
+        reset_string(&s);
+        if (generate_uuid_string(uuid_str) != 0) goto fail_server_cert;
         snprintf(path, sizeof(path),
             "/pair?uniqueid=%s&uuid=%s&devicename=PS3&updateState=1&phrase=pairchallenge",
             info->unique_id, uuid_str);
@@ -916,11 +1104,10 @@ fail:
 // Fetch server's appversion from /serverinfo (HTTP)
 int hv_get_server_info(handshake_info_t *info) {
     char path[512];
-    struct string s;
+    struct string s = {0};
     snprintf(path, sizeof(path), "/serverinfo?uniqueid=%s", info->unique_id);
     if (ps3_http_request(info, path, &s) != 0) {
         NLOG("hv_get_server_info: failed");
-        free(s.ptr);
         return -1;
     }
     char *appver = extract_xml(s.ptr, "appversion");
@@ -931,7 +1118,9 @@ int hv_get_server_info(handshake_info_t *info) {
         // Sunshine sometimes returns e.g. "7.1.431.-1" — replace negative component with 0
         char *p = info->server_app_version;
         while (*p) {
-            if (p[0] == '-' && p[-1] == '.') { *p = '0'; }
+            if (*p == '-' && p > info->server_app_version && p[-1] == '.') {
+                *p = '0';
+            }
             p++;
         }
         free(appver);
@@ -947,15 +1136,12 @@ int hv_get_server_info(handshake_info_t *info) {
 // Fetch first app ID from Sunshine via HTTPS /applist
 int hv_get_first_appid(handshake_info_t *info) {
     char path[512];
-    struct string s;
+    struct string s = {0};
     char uuid_str[40];
-    snprintf(uuid_str, sizeof(uuid_str), "%08x-%04x-4%03x-%04x-%08x%04x",
-        rand()&0xffffffff, rand()&0xffff, rand()&0x0fff,
-        (rand()&0x3fff)|0x8000, rand()&0xffffffff, rand()&0xffff);
+    if (generate_uuid_string(uuid_str) != 0) return -1;
     snprintf(path, sizeof(path), "/applist?uniqueid=%s&uuid=%s", info->unique_id, uuid_str);
     if (ps3_https_request(info, path, &s) != 0) {
         NLOG("hv_get_first_appid: HTTPS request failed");
-        free(s.ptr);
         return -1;
     }
     NLOG("Applist response: %.600s", s.ptr ? s.ptr : "");
@@ -974,32 +1160,29 @@ int hv_get_first_appid(handshake_info_t *info) {
 }
 
 // Helper: build the common launch/resume query params
-static void build_launch_params(char *path, size_t pathsz,
-                                const char *verb,
-                                handshake_info_t *info, int app_id,
-                                const char *rikey, int rikeyid) {
+static int build_launch_params(char *path, size_t pathsz,
+                               const char *verb,
+                               handshake_info_t *info, int app_id,
+                               const char *rikey, int rikeyid) {
     char uuid_str[40];
-    snprintf(uuid_str, sizeof(uuid_str), "%08x-%04x-4%03x-%04x-%08x%04x",
-        rand()&0xffffffff, rand()&0xffff, rand()&0x0fff,
-        (rand()&0x3fff)|0x8000, rand()&0xffffffff, rand()&0xffff);
+    if (generate_uuid_string(uuid_str) != 0) return -1;
 
-    snprintf(path, pathsz,
+    int length = snprintf(path, pathsz,
         "/%s?uniqueid=%s&uuid=%s&appid=%d&mode=1280x720x60"
         "&additionalStates=1&sops=1"
         "&rikey=%s&rikeyid=%d"
         "&localAudioPlayMode=0&surroundAudioInfo=196610"
         "&remoteControllersBitmap=1&gcmap=1&corever=1",
         verb, info->unique_id, uuid_str, app_id, rikey, rikeyid);
+    return length >= 0 && (size_t)length < pathsz ? 0 : -1;
 }
 
 // Send /cancel to end any existing session
 static void hv_cancel(handshake_info_t *info) {
     char path[512];
-    struct string s;
+    struct string s = {0};
     char uuid_str[40];
-    snprintf(uuid_str, sizeof(uuid_str), "%08x-%04x-4%03x-%04x-%08x%04x",
-        rand()&0xffffffff, rand()&0xffff, rand()&0x0fff,
-        (rand()&0x3fff)|0x8000, rand()&0xffffffff, rand()&0xffff);
+    if (generate_uuid_string(uuid_str) != 0) return;
     snprintf(path, sizeof(path), "/cancel?uniqueid=%s&uuid=%s", info->unique_id, uuid_str);
     NLOG("Sending /cancel to clear existing session...");
     if (ps3_https_request(info, path, &s) == 0) {
@@ -1013,6 +1196,7 @@ static void parse_session_url(handshake_info_t *info, const char *response) {
     char *session_url = extract_xml(response, "sessionUrl0");
     if (session_url) {
         strncpy(info->rtsp_session_url, session_url, sizeof(info->rtsp_session_url) - 1);
+        info->rtsp_session_url[sizeof(info->rtsp_session_url) - 1] = '\0';
         NLOG("RTSP session URL: %s", info->rtsp_session_url);
         free(session_url);
     } else {
@@ -1024,11 +1208,12 @@ static void parse_session_url(handshake_info_t *info, const char *response) {
 
 int hv_launch(handshake_info_t *info, int app_id, const char *rikey, int rikeyid) {
     char path[4096];
-    struct string s;
+    struct string s = {0};
 
     // --- Try /resume first (handles "already running" sessions)
-    build_launch_params(path, sizeof(path), "resume", info, app_id, rikey, rikeyid);
-    NLOG("Trying /resume: %s", path);
+    if (build_launch_params(path, sizeof(path), "resume", info, app_id, rikey, rikeyid) != 0)
+        return -1;
+    NLOG("Trying to resume the existing session");
     if (ps3_https_request(info, path, &s) == 0 && s.ptr) {
         NLOG("Resume response: %.400s", s.ptr);
         char *rv = extract_xml(s.ptr, "resume");
@@ -1037,13 +1222,13 @@ int hv_launch(handshake_info_t *info, int app_id, const char *rikey, int rikeyid
         if (resumed == 1) {
             NLOG("Session resumed successfully.");
             parse_session_url(info, s.ptr);
-            free(s.ptr);
+            reset_string(&s);
             return 0;
         }
         NLOG("/resume returned 0 or missing — will cancel and launch fresh.");
-        free(s.ptr);
+        reset_string(&s);
     } else {
-        free(s.ptr);
+        reset_string(&s);
         NLOG("/resume request failed.");
     }
 
@@ -1054,9 +1239,10 @@ int hv_launch(handshake_info_t *info, int app_id, const char *rikey, int rikeyid
     sleep(1);
 
     // --- Try fresh /launch
-    build_launch_params(path, sizeof(path), "launch", info, app_id, rikey, rikeyid);
-    NLOG("Launch request: %s", path);
-    init_string(&s);
+    if (build_launch_params(path, sizeof(path), "launch", info, app_id, rikey, rikeyid) != 0)
+        return -1;
+    NLOG("Sending launch request");
+    reset_string(&s);
     if (ps3_https_request(info, path, &s) != 0) {
         NLOG("Launch HTTPS failed.");
         free(s.ptr);
@@ -1080,5 +1266,3 @@ int hv_launch(handshake_info_t *info, int app_id, const char *rikey, int rikeyid
     NLOG("Launch successful!");
     return 0;
 }
-
-
