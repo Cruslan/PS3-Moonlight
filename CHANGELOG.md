@@ -24,7 +24,7 @@ All notable changes to the Moonlight PS3 project will be documented in this file
 
 - **Hardware Accelerated Video Decoding**: High-performance 720p60 H.264 video decoding utilizing the PlayStation 3 Cell Broadband Engine `cellVdec` hardware decoder interface, mapped directly to RSX graphics memory via Tiny3D.
 - **Low-Latency Opus Audio Engine**: Custom PS3 audio backend (`src/audio/ps3.c`) featuring thread-safe ring buffering, low-latency PCM playback via `sysAudio`, and automatic buffer underflow/overflow recovery.
-- **GameStream & Sunshine Protocol Compatibility**: Native HTTP/HTTPS pairing pipeline with client certificate generation, PIN challenge handshake, RTSP stream setup, and session control. Default client pairing PIN is `0000`.
+- **GameStream & Sunshine Protocol Compatibility**: Native HTTP/HTTPS pairing pipeline with client certificate generation, dynamic 4-digit random PIN challenge handshake, RTSP stream setup, and session control.
 - **DualShock 3 Input Engine**: Low-latency gamepad input processing via `sysUtil` with analog stick deadzone filtering, button mapping, and stream abort hotkey (`Select + Start + L3 + R3`).
 - **Real-Time Performance HUD**: On-screen overlay displaying metrics for FPS, network RTT, video decode latency, render overhead, and packet loss statistics.
 - **OpenSSL Compatibility Layer**: Custom OpenSSL abstraction layer translating crypto and TLS operations to PolarSSL/mbedTLS to avoid symbol collisions on PSL1GHT.

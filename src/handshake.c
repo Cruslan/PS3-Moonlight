@@ -152,18 +152,15 @@ static int certificate_fingerprint(const x509_crt *certificate,
 static int save_server_fingerprint(const handshake_info_t *info,
                                    const x509_crt *certificate) {
     unsigned char fingerprint[32];
-    char temporary_path[sizeof(info->server_cert_hash_path) + 5];
 
     if (certificate_fingerprint(certificate, fingerprint) != 0) return -1;
-    if (snprintf(temporary_path, sizeof(temporary_path), "%s.tmp",
-                 info->server_cert_hash_path) >= (int)sizeof(temporary_path)) return -1;
 
-    FILE *file = fopen(temporary_path, "wb");
+    FILE *file = fopen(info->server_cert_hash_path, "wb");
     if (!file) return -1;
     int ok = fwrite(fingerprint, 1, sizeof(fingerprint), file) == sizeof(fingerprint);
     if (fclose(file) != 0) ok = 0;
-    if (!ok || rename(temporary_path, info->server_cert_hash_path) != 0) {
-        unlink(temporary_path);
+    if (!ok) {
+        unlink(info->server_cert_hash_path);
         return -1;
     }
     return 0;

@@ -26,7 +26,7 @@ Moonlight PS3 is an open-source PlayStation 3 homebrew client for NVIDIA GameStr
    ```
 
 2. **Prepare the PS3 SDK Environment**:
-   Downloads and extracts the pre-compiled `ps3dev` PPU toolchain and PSL1GHT SDK archive directly into `./ps3dev` inside the project directory. This provides the `ppu-gcc` cross-compiler, Cell Broadband Engine PPU headers, system libraries (`sysAudio`, `sysUtil`, `cellVdec`, `Tiny3D`, `PolarSSL`), and PKG packaging tools (`make_self_npdrm`, `fself`, `pkg`), enabling isolated building without requiring system-wide installations or root privileges:
+   Automatically detects your host operating system and architecture (`macOS Apple Silicon ARM64`, `macOS Intel x64`, or `Linux x64`), then downloads and extracts the official pre-compiled `ps3dev` PPU toolchain and PSL1GHT SDK archive directly into `./ps3dev` inside the project directory. This sets up the `ppu-gcc` cross-compiler, Cell Broadband Engine PPU headers, system libraries (`sysAudio`, `sysUtil`, `cellVdec`, `Tiny3D`, `PolarSSL`), and PKG packaging utilities (`make_self_npdrm`, `fself`, `pkg`), enabling completely isolated zero-friction builds without requiring system-wide toolchain installations or root privileges:
    ```bash
    make prepare
    ```
@@ -48,9 +48,9 @@ Moonlight PS3 is an open-source PlayStation 3 homebrew client for NVIDIA GameStr
 2. Ensure your host PC running Sunshine or NVIDIA GameStream is connected to the same local network.
 3. Launch Moonlight PS3.
 4. Set your host PC IP address.
-5. Enter the randomly generated four-digit PIN shown in the Moonlight PS3 log panel into Sunshine / GameStream.
+5. Enter the dynamically generated random four-digit PIN displayed on the Moonlight PS3 screen (and log output) into the Sunshine / GameStream Web UI on your PC.
 
-The paired server certificate is pinned per host. Existing installations upgrading from an older build must pair once more to create the host certificate fingerprint.
+The paired server certificate is pinned per host upon successful pairing. Existing installations upgrading from an older build must pair once more to create the host certificate fingerprint.
 
 ## Credits
 
