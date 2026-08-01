@@ -1,4 +1,5 @@
 #include "openssl_compat.h"
+#include "random.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -20,8 +21,8 @@ int mbedtls_ctr_drbg_random(void *p_rng, unsigned char *output, size_t output_le
 }
 
 int mbedtls_entropy_func(void *data, unsigned char *output, size_t len) {
-    for (size_t i = 0; i < len; i++) output[i] = rand() % 256;
-    return 0;
+    (void)data;
+    return ps3_random_bytes(output, len);
 }
 
 // Cipher API
@@ -111,21 +112,9 @@ const cipher_info_t * mbedtls_cipher_info_from_values(int cipher_id, int key_bit
     return cipher_info_from_values((cipher_id_t)cipher_id, key_bitlen, (cipher_mode_t)mode);
 }
 
-static int dummy_entropy_func(void *data, unsigned char *output, size_t len) {
-    for (size_t i = 0; i < len; i++) output[i] = rand() & 0xFF;
-    return 0;
-}
-
 int RAND_bytes(unsigned char *buf, int num) {
-    static ctr_drbg_context ctr_drbg;
-    static int initialized = 0;
-
-    if (!initialized) {
-        ctr_drbg_init(&ctr_drbg, dummy_entropy_func, NULL, NULL, 0);
-        initialized = 1;
-    }
-
-    return ctr_drbg_random(&ctr_drbg, buf, num) == 0 ? 1 : 0;
+    if (num < 0) return 0;
+    return ps3_random_bytes(buf, (size_t)num) == 0 ? 1 : 0;
 }
 
 const void* EVP_sha256() {
@@ -133,6 +122,8 @@ const void* EVP_sha256() {
 }
 
 int EVP_DigestSignInit(EVP_MD_CTX *ctx, void **pctx, const void *type, void *e, EVP_PKEY *pkey) {
+    (void)pctx;
+    (void)e;
     md_init(&ctx->md_ctx);
     md_init_ctx(&ctx->md_ctx, (const md_info_t *)type);
     md_starts(&ctx->md_ctx);
@@ -146,6 +137,7 @@ int EVP_DigestSignUpdate(EVP_MD_CTX *ctx, const void *d, size_t cnt) {
 }
 
 static int rand_wrapper(void* p_rng, unsigned char* output, size_t output_len) {
+    (void)p_rng;
     return RAND_bytes(output, (int)output_len) == 1 ? 0 : -1;
 }
 
@@ -157,6 +149,8 @@ int EVP_DigestSignFinal(EVP_MD_CTX *ctx, unsigned char *sig, size_t *siglen) {
 }
 
 int EVP_DigestVerifyInit(EVP_MD_CTX *ctx, void **pctx, const void *type, void *e, EVP_PKEY *pkey) {
+    (void)pctx;
+    (void)e;
     md_init(&ctx->md_ctx);
     md_init_ctx(&ctx->md_ctx, (const md_info_t *)type);
     md_starts(&ctx->md_ctx);
@@ -176,6 +170,8 @@ int EVP_DigestVerifyFinal(EVP_MD_CTX *ctx, const unsigned char *sig, size_t sigl
 }
 
 X509* PEM_read_X509(FILE *fp, X509 **x, void *cb, void *u) {
+    (void)cb;
+    (void)u;
     fseek(fp, 0, SEEK_END);
     long fsize = ftell(fp);
     fseek(fp, 0, SEEK_SET);
@@ -191,6 +187,8 @@ X509* PEM_read_X509(FILE *fp, X509 **x, void *cb, void *u) {
 }
 
 EVP_PKEY* PEM_read_PrivateKey(FILE *fp, EVP_PKEY **x, void *cb, void *u) {
+    (void)cb;
+    (void)u;
     fseek(fp, 0, SEEK_END);
     long fsize = ftell(fp);
     fseek(fp, 0, SEEK_SET);

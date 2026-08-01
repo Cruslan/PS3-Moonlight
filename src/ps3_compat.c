@@ -2,6 +2,7 @@
 #include <string.h>
 #include <netinet/in.h>
 #include <netdb.h>
+#include <sys/time.h>
 #include <sys/socket.h>
 
 #include "../third_party/moonlight-common-c/src/ps3_compat.h"
@@ -59,10 +60,12 @@ void freeaddrinfo(struct addrinfo *res) {
 
 
 #include "uuid.h"
+#include "random.h"
 
 void uuid_generate_random(uuid_t out) {
-    for (int i = 0; i < 16; i++) {
-        out[i] = rand() % 256;
+    if (ps3_random_bytes(out, sizeof(uuid_t)) != 0) {
+        memset(out, 0, sizeof(uuid_t));
+        return;
     }
     // Set UUID version to 4
     out[6] = (out[6] & 0x0F) | 0x40;
@@ -80,5 +83,8 @@ void uuid_unparse(const uuid_t uu, char *out) {
 }
 
 int sigaction(int signum, const void *act, void *oldact) {
+    (void)signum;
+    (void)act;
+    (void)oldact;
     return 0;
 }

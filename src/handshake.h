@@ -9,8 +9,8 @@ typedef struct {
     char address[64];
     char client_cert_path[256];
     char client_key_path[256];
+    char server_cert_hash_path[256];
     char unique_id[64];
-    uint32_t connect_data;
     char rtsp_session_url[256];
     char server_app_version[32]; // e.g. "7.1.431.0" from /serverinfo
 } handshake_info_t;

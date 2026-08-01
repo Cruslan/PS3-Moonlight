@@ -29,7 +29,7 @@ static int rb_read_idx = 0;
 static sys_mutex_t rb_mutex;
 
 /* Thread and audio system handles */
-static int active_audio_thread = 0;
+static volatile int active_audio_thread = 0;
 static u32 audio_port;
 static audioPortConfig audio_cfg;
 static sys_event_queue_t audio_queue;
@@ -114,6 +114,7 @@ static int rb_read(float* data, int num_floats) {
  * circular audio hardware buffer is free, then writes the next decoded block of floats.
  */
 static void audio_loop(void* arg) {
+    (void)arg;
     sys_event_t event;
     u32 current_block = 0;
     float temp_block[AUDIO_CHANNELS * AUDIO_BLOCK_SAMPLES];
@@ -175,6 +176,13 @@ static void ps3_renderer_cleanup() {
  * Initialize the PS3 audio output system, notify queue, ring buffer mutex, and the Opus decoder.
  */
 static int ps3_renderer_init(int audioConfiguration, const POPUS_MULTISTREAM_CONFIGURATION opusConfig, void* audioContext, int arFlags) {
+    (void)audioConfiguration;
+    (void)audioContext;
+    (void)arFlags;
+    if (!opusConfig || opusConfig->sampleRate != 48000 ||
+        opusConfig->channelCount != AUDIO_CHANNELS || opusConfig->streams <= 0) {
+        return -1;
+    }
     if (audioInit() != 0) return -1;
     
     /* Reset circular buffer indices and packets counter */
@@ -251,10 +259,9 @@ static int ps3_renderer_init(int audioConfiguration, const POPUS_MULTISTREAM_CON
         return -1;
     }
     
-    /* Create and start the playback thread with high priority (100) */
-    active_audio_thread = 1;
-    if (sysThreadCreate(&audio_thread, audio_loop, 0, 100, 0x4000, THREAD_JOINABLE, "Audio Thread") != 0) {
-        active_audio_thread = 0;
+    /* Start the port before the playback thread so startup rollback cannot
+     * leave a thread blocked forever waiting for hardware notifications. */
+    if (audioPortStart(audio_port) != 0) {
         audioRemoveNotifyEventQueue(audio_key);
         sysEventQueueDestroy(audio_queue, 0);
         audioPortClose(audio_port);
@@ -264,9 +271,21 @@ static int ps3_renderer_init(int audioConfiguration, const POPUS_MULTISTREAM_CON
         audioQuit();
         return -1;
     }
-    
-    /* Enable audio playback on the hardware port */
-    audioPortStart(audio_port);
+
+    /* Create and start the playback thread with high priority (100) */
+    active_audio_thread = 1;
+    if (sysThreadCreate(&audio_thread, audio_loop, 0, 100, 0x4000, THREAD_JOINABLE, "Audio Thread") != 0) {
+        active_audio_thread = 0;
+        audioPortStop(audio_port);
+        audioRemoveNotifyEventQueue(audio_key);
+        sysEventQueueDestroy(audio_queue, 0);
+        audioPortClose(audio_port);
+        opus_multistream_decoder_destroy(opus_decoder);
+        opus_decoder = NULL;
+        sysMutexDestroy(rb_mutex);
+        audioQuit();
+        return -1;
+    }
     
     return 0;
 }
