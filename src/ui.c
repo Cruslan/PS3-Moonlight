@@ -20,11 +20,12 @@ static int ui_width = 1280;
 static int ui_height = 720;
 static float scale_x = 1.0f;
 static float scale_y = 1.0f;
+static float scale_font = 1.0f;
 static volatile int ui_state = UI_STATE_IP_ENTRY;
 
 #define SX(x) ((float)(x) * scale_x)
 #define SY(y) ((float)(y) * scale_y)
-#define SF(s) ((u32)(((float)(s) * scale_y < 8.0f) ? 8.0f : ((float)(s) * scale_y)))
+#define SF(s) ((u32)(((float)(s) * scale_font < 8.0f) ? 8.0f : ((float)(s) * scale_font)))
 
 // IP state
 static int ip_octets[4] = {192, 168, 1, 1};
@@ -176,6 +177,7 @@ void ui_init(int width, int height) {
     ui_height = (height > 0) ? height : 720;
     scale_x = (float)ui_width / 1280.0f;
     scale_y = (float)ui_height / 720.0f;
+    scale_font = (scale_x < scale_y) ? scale_x : scale_y;
 
     sys_mutex_attr_t attr;
     sysMutexAttrInitialize(attr);
