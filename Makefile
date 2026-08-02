@@ -34,8 +34,8 @@ TARGET		:= moonlight-ps3
 BUILD		:= build
 OFILES		:= src/main.o src/ui.o src/video/ps3.o src/ps3_compat.o src/random.o src/net_logger.o src/openssl_compat.o src/connection.o src/input/ps3.o src/audio/ps3.o src/handshake.o
 # Enable Cell Broadband Engine CPU optimizations for the PowerPC Processing Unit (PPU)
-CFLAGS		+= -mcpu=cell -O2 -Wall -Wextra -MMD -MP -I$(PS3DEV)/ppu/include -I$(PS3DEV)/portlibs/ppu/include -I./src -I./src/video -I./third_party/moonlight-common-c/src -I./third_party/opus/include -include src/openssl_compat.h -fno-lto
-LDFLAGS     += -fno-lto
+CFLAGS		+= -mcpu=cell -O2 -Wall -Wextra -Werror=implicit-function-declaration -MMD -MP -I$(PS3DEV)/ppu/include -I$(PS3DEV)/portlibs/ppu/include -I./src -I./src/video -I./third_party/moonlight-common-c/src -I./third_party/opus/include -include src/openssl_compat.h -fno-lto
+LDFLAGS     += -fno-lto -Wl,--no-undefined -Wl,--as-needed
 # Link with polarssl for client-side cryptography. The moonlight-common-c
 # submodule expects mbedtls, but we emulate it via src/openssl_compat.c
 # mapping to PolarSSL to avoid conflicts with the portlib mbedtls library.
