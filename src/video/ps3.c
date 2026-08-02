@@ -489,6 +489,15 @@ static int ps3_video_submit_decode_unit(PDECODE_UNIT decodeUnit) {
   }
 
   // Step 1: Concatenate all fragments (entries) into one continuous buffer
+  static int debug_frame_count = 0;
+  if (++debug_frame_count % 120 == 1) {
+    int entries_count = 0;
+    PLENTRY e = decodeUnit->bufferList;
+    while (e) { entries_count++; e = e->next; }
+    printf("[VDEC] Frame %d: %d NAL units (slices) in decode unit (len=%d)\n",
+           debug_frame_count, entries_count, decodeUnit->fullLength);
+  }
+
   u32 length = 0;
   PLENTRY entry = decodeUnit->bufferList;
   while (entry != NULL) {
@@ -609,7 +618,7 @@ DECODER_RENDERER_CALLBACKS decoder_callbacks_ps3 = {
     // submitDecodeUnit(), keeping the recv thread free to drain the socket.
     // The decode unit queue is sized to 120 frames on PS3 to absorb transient
     // VDEC stalls without overflowing.
-    .capabilities = 0};
+    .capabilities = CAPABILITY_SLICES_PER_FRAME(4)};
 
 // Video Thread flag
 static int active_video_thread = 0;

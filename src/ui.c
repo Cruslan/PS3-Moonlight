@@ -168,20 +168,7 @@ static void * texture_mem = NULL;
 void ui_init(int width, int height) {
     ui_width = width;
     ui_height = height;
-    tiny3d_Init(1024 * 1024); // 1MB vertex buffer
-    
-    // Alloc RSX memory for font texture
-    texture_mem = tiny3d_AllocTexture(64 * 1024);
-    if (!texture_mem) return;
-    
-    ResetFont();
-    // Add our embedded font as font 0
-    AddFontFromBitmapArray((u8 *)font_8x8_basic, (u8 *)texture_mem, 32, 127, 8, 8, 1, BIT7_FIRST_PIXEL);
-    
-    SetCurrentFont(0);
-    SetFontSize(16, 16);  // Proportional font sizing
-    SetFontColor(0xffffffff, 0x00000000); // White on transparent
-    
+
     sys_mutex_attr_t attr;
     sysMutexAttrInitialize(attr);
     if (sysMutexCreate(&log_mutex, &attr) == 0) {
@@ -239,6 +226,16 @@ static void draw_background_gradient() {
 static void ui_loop(void *arg) {
     (void)arg;
     ps3_pad_state_t pad;
+    
+    tiny3d_Init(1024 * 1024); // 1MB vertex buffer
+    texture_mem = tiny3d_AllocTexture(64 * 1024);
+    if (texture_mem) {
+        ResetFont();
+        AddFontFromBitmapArray((u8 *)font_8x8_basic, (u8 *)texture_mem, 32, 127, 8, 8, 1, BIT7_FIRST_PIXEL);
+        SetCurrentFont(0);
+        SetFontSize(16, 16);
+        SetFontColor(0xffffffff, 0x00000000);
+    }
     
     while (ui_running) {
         ps3input_get_data(&pad);
