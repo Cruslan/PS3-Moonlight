@@ -142,7 +142,7 @@ void ps3input_start() {
     memset(&g_pad_state, 0, sizeof(g_pad_state));
     active_input_thread = 1;
     // Priority 200: Input should preempt almost everything except critical network receive (100)
-    if (sysThreadCreate(&input_thread, input_loop, 0, 200, 0x2000,
+    if (sysThreadCreate(&input_thread, input_loop, 0, 200, 0x8000,
                         THREAD_JOINABLE, "InputThread") != 0) {
         active_input_thread = 0;
         sysMutexDestroy(pad_state_mutex);

@@ -18,7 +18,14 @@ static int ui_thread_started = 0;
 static volatile int ui_running = 1;
 static int ui_width = 1280;
 static int ui_height = 720;
+static float scale_x = 1.0f;
+static float scale_y = 1.0f;
+static float scale_font = 1.0f;
 static volatile int ui_state = UI_STATE_IP_ENTRY;
+
+#define SX(x) ((float)(x) * scale_x)
+#define SY(y) ((float)(y) * scale_y)
+#define SF(s) ((u32)(((float)(s) * scale_font < 8.0f) ? 8.0f : ((float)(s) * scale_font)))
 
 // IP state
 static int ip_octets[4] = {192, 168, 1, 1};
@@ -166,22 +173,12 @@ static const unsigned char font_8x8_basic[96][8] = {
 static void * texture_mem = NULL;
 
 void ui_init(int width, int height) {
-    ui_width = width;
-    ui_height = height;
-    tiny3d_Init(1024 * 1024); // 1MB vertex buffer
-    
-    // Alloc RSX memory for font texture
-    texture_mem = tiny3d_AllocTexture(64 * 1024);
-    if (!texture_mem) return;
-    
-    ResetFont();
-    // Add our embedded font as font 0
-    AddFontFromBitmapArray((u8 *)font_8x8_basic, (u8 *)texture_mem, 32, 127, 8, 8, 1, BIT7_FIRST_PIXEL);
-    
-    SetCurrentFont(0);
-    SetFontSize(16, 16);  // Proportional font sizing
-    SetFontColor(0xffffffff, 0x00000000); // White on transparent
-    
+    ui_width = (width > 0) ? width : 1280;
+    ui_height = (height > 0) ? height : 720;
+    scale_x = (float)ui_width / 1280.0f;
+    scale_y = (float)ui_height / 720.0f;
+    scale_font = (scale_x < scale_y) ? scale_x : scale_y;
+
     sys_mutex_attr_t attr;
     sysMutexAttrInitialize(attr);
     if (sysMutexCreate(&log_mutex, &attr) == 0) {
@@ -239,6 +236,16 @@ static void draw_background_gradient() {
 static void ui_loop(void *arg) {
     (void)arg;
     ps3_pad_state_t pad;
+    
+    tiny3d_Init(1024 * 1024); // 1MB vertex buffer
+    texture_mem = tiny3d_AllocTexture(64 * 1024);
+    if (texture_mem) {
+        ResetFont();
+        AddFontFromBitmapArray((u8 *)font_8x8_basic, (u8 *)texture_mem, 32, 127, 8, 8, 1, BIT7_FIRST_PIXEL);
+        SetCurrentFont(0);
+        SetFontSize(16, 16);
+        SetFontColor(0xffffffff, 0x00000000);
+    }
     
     while (ui_running) {
         ps3input_get_data(&pad);
@@ -310,18 +317,22 @@ static void ui_loop(void *arg) {
             
             // Draw Video FPS Counter (Top Left) if enabled
             if (show_stats) {
-                SetFontSize(16, 16);
+                SetFontSize(SF(16), SF(16));
                 SetFontColor(0xff00ff00, 0); // Neo-Matrix green
-                DrawFormatString(30, 30, "Rendered FPS: %d", ps3video_get_current_fps());
-                DrawFormatString(30, 50, "Decoded FPS: %d", ps3video_get_decoded_fps());
-                DrawFormatString(30, 70, "UI Loop FPS: %d", ui_fps_actual);
-                DrawFormatString(30, 90, "Decode Latency: %d ms", ps3video_get_decode_latency());
-                DrawFormatString(30, 110, "Render Latency: %d ms", ps3video_get_render_latency());
-                DrawFormatString(30, 130, "Network Latency: %d ms", ps3video_get_net_latency() / 2);
-                DrawFormatString(30, 150, "Total Latency: %d ms", (ps3video_get_net_latency() / 2) + ps3video_get_decode_latency() + ps3video_get_render_latency());
-                DrawFormatString(30, 170, "Resolution: 1280x720");
-                DrawFormatString(30, 190, "Target FPS: %d FPS", ui_get_fps());
-                DrawFormatString(30, 210, "Bitrate: %d Mbps", ui_get_bitrate() / 1000);
+                float sx = SX(30);
+                float sy = SY(30);
+                float line_h = SY(20);
+
+                DrawFormatString(sx, sy + 0 * line_h, "Rendered FPS: %d", ps3video_get_current_fps());
+                DrawFormatString(sx, sy + 1 * line_h, "Decoded FPS: %d", ps3video_get_decoded_fps());
+                DrawFormatString(sx, sy + 2 * line_h, "UI Loop FPS: %d", ui_fps_actual);
+                DrawFormatString(sx, sy + 3 * line_h, "Decode Latency: %d ms", ps3video_get_decode_latency());
+                DrawFormatString(sx, sy + 4 * line_h, "Render Latency: %d ms", ps3video_get_render_latency());
+                DrawFormatString(sx, sy + 5 * line_h, "Network Latency: %d ms", ps3video_get_net_latency() / 2);
+                DrawFormatString(sx, sy + 6 * line_h, "Total Latency: %d ms", (ps3video_get_net_latency() / 2) + ps3video_get_decode_latency() + ps3video_get_render_latency());
+                DrawFormatString(sx, sy + 7 * line_h, "Resolution: %dx%d", ui_width, ui_height);
+                DrawFormatString(sx, sy + 8 * line_h, "Target FPS: %d FPS", ui_get_fps());
+                DrawFormatString(sx, sy + 9 * line_h, "Bitrate: %d Mbps", ui_get_bitrate() / 1000);
                 
                 /* Draw temporary visual debug info for audio stream activity */
                 u32 audio_pkts = ps3audio_get_decoded_packets();
@@ -332,22 +343,22 @@ static void ui_loop(void *arg) {
                     case 2: spinner = "[ | ]"; break;
                     case 3: spinner = "[ / ]"; break;
                 }
-                DrawFormatString(30, 230, "Audio Packets: %u %s", audio_pkts, spinner);
+                DrawFormatString(sx, sy + 10 * line_h, "Audio Packets: %u %s", audio_pkts, spinner);
             }
         } else {
             draw_background_gradient();
             
-            SetFontSize(32, 32);
+            SetFontSize(SF(32), SF(32));
             SetFontColor(0xffffffff, 0);
-            DrawString(100, 100, "Moonlight PS3 - Server Setup");
+            DrawString(SX(100), SY(100), "Moonlight PS3 - Server Setup");
             
             if (ui_state == UI_STATE_IP_ENTRY) {
-                SetFontSize(24, 24);
-                DrawString(100, 160, "Enter Sunshine IP address:");
+                SetFontSize(SF(24), SF(24));
+                DrawString(SX(100), SY(160), "Enter Sunshine IP address:");
                 
                 for (int i = 0; i < 4; i++) {
-                    int x = 120 + (i * 110); 
-                    int y = 210;
+                    float x = SX(120 + (i * 110)); 
+                    float y = SY(210);
 
                     if (i == active_octet) {
                         SetFontColor(0xff00ff00, 0);
@@ -358,73 +369,75 @@ static void ui_loop(void *arg) {
                     DrawFormatString(x, y, "%d", ip_octets[i]);
                     
                     SetFontColor(0xffffffff, 0);
-                    if (i < 3) DrawString(x + 75, y, ".");
+                    if (i < 3) DrawString(x + SX(75), y, ".");
                 }
                 
-                SetFontSize(20, 20);
+                SetFontSize(SF(20), SF(20));
                 SetFontColor(0xffaaaaaa, 0);
-                DrawString(100, 280, "Target FPS:");
+                DrawString(SX(100), SY(280), "Target FPS:");
                 
                 if (active_octet == 4) {
                     SetFontColor(0xff00ff00, 0);
                 } else {
                     SetFontColor(0xffffffff, 0);
                 }
-                DrawFormatString(450, 280, "[ %d FPS ]", ui_fps);
+                DrawFormatString(SX(450), SY(280), "[ %d FPS ]", ui_fps);
 
                 SetFontColor(0xffaaaaaa, 0);
-                DrawString(100, 315, "Target Bitrate:");
+                DrawString(SX(100), SY(315), "Target Bitrate:");
                 
                 if (active_octet == 5) {
                     SetFontColor(0xff00ff00, 0);
                 } else {
                     SetFontColor(0xffffffff, 0);
                 }
-                DrawFormatString(450, 315, "[ %d Mbps ]", ui_bitrate_options[ui_bitrate_idx] / 1000);
+                DrawFormatString(SX(450), SY(315), "[ %d Mbps ]", ui_bitrate_options[ui_bitrate_idx] / 1000);
 
                 SetFontColor(0xffaaaaaa, 0);
-                DrawString(100, 350, "VSync:");
+                DrawString(SX(100), SY(350), "VSync:");
                 
                 if (active_octet == 6) {
                     SetFontColor(0xff00ff00, 0);
                 } else {
                     SetFontColor(0xffffffff, 0);
                 }
-                DrawFormatString(450, 350, "[ %s ]", ui_vsync ? "ON" : "OFF");
+                DrawFormatString(SX(450), SY(350), "[ %s ]", ui_vsync ? "ON" : "OFF");
 
                 SetFontColor(0xffaaaaaa, 0);
-                DrawString(100, 385, "Stats Overlay:");
+                DrawString(SX(100), SY(385), "Stats Overlay:");
                 
                 if (active_octet == 7) {
                     SetFontColor(0xff00ff00, 0);
                 } else {
                     SetFontColor(0xffffffff, 0);
                 }
-                DrawFormatString(450, 385, "[ %s ]", show_stats ? "ON" : "OFF");
+                DrawFormatString(SX(450), SY(385), "[ %s ]", show_stats ? "ON" : "OFF");
 
                 SetFontColor(0xffaaaaaa, 0);
-                DrawString(100, 420, "Verbose Logging:");
+                DrawString(SX(100), SY(420), "Verbose Logging:");
                 
                 if (active_octet == 8) {
                     SetFontColor(0xff00ff00, 0);
                 } else {
                     SetFontColor(0xffffffff, 0);
                 }
-                DrawFormatString(450, 420, "[ %s ]", ui_verbose ? "ON" : "OFF");
+                DrawFormatString(SX(450), SY(420), "[ %s ]", ui_verbose ? "ON" : "OFF");
 
-                SetFontSize(22, 22);
+                SetFontSize(SF(22), SF(22));
                 SetFontColor(0xffaaaaaa, 0);
-                DrawString(100, 470, "PRESS [X] TO CONNECT / PAIR");
+                DrawString(SX(100), SY(470), "PRESS [X] TO CONNECT / PAIR");
             } else if (ui_state == UI_STATE_PAIRING) {
+                SetFontSize(SF(24), SF(24));
                 SetFontColor(0xffffff00, 0);
-                DrawString(100, 240, "Pairing / Connecting... Please check host.");
-                SetFontSize(20, 20);
+                DrawString(SX(100), SY(240), "Pairing / Connecting... Please check host.");
+                SetFontSize(SF(20), SF(20));
                 SetFontColor(0xffaaaaaa, 0);
-                DrawString(100, 300, "PRESS (O) TO CANCEL");
+                DrawString(SX(100), SY(300), "PRESS (O) TO CANCEL");
             } else if (ui_state == UI_STATE_ERROR) {
+                SetFontSize(SF(24), SF(24));
                 SetFontColor(0xffff0000, 0);
-                DrawString(100, 240, "ERROR: Target unreachable or Pairing failed.");
-                DrawString(100, 300, "Press [X] to return.");
+                DrawString(SX(100), SY(240), "ERROR: Target unreachable or Pairing failed.");
+                DrawString(SX(100), SY(300), "Press [X] to return.");
                 if (pad.buttons_pressed & A_FLAG) ui_state = UI_STATE_IP_ENTRY;
             }
         }
@@ -452,10 +465,10 @@ static void ui_loop(void *arg) {
             tiny3d_VertexFcolor(0.05f, 0.05f, 0.05f, 0.8f);
             tiny3d_End();
 
-            SetFontSize(16, 16);
+            SetFontSize(SF(16), SF(16));
             SetFontColor(0xff00ff00, 0); // Neo-Matrix green for debug logs
             for (int i = 0; i < visible_log_count; i++) {
-                DrawString(20, ui_height * 0.71f + (i * 20), visible_logs[i]);
+                DrawString(SX(20), (ui_height * 0.71f) + (i * SY(20)), visible_logs[i]);
             }
         }
 

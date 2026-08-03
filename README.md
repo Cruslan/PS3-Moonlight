@@ -4,12 +4,13 @@ Moonlight PS3 is an open-source PlayStation 3 homebrew client for NVIDIA GameStr
 
 ## Features
 
-- **Hardware Accelerated H.264 Video Decoding**: High-performance 720p60 H.264 video decoding using the PS3 Cell Broadband Engine `cellVdec` hardware decoder interface, mapped directly to RSX graphics memory via Tiny3D.
+- **Hardware Accelerated H.264 Video Decoding**: High-performance 720p60 H.264 video decoding using the PS3 Cell Broadband Engine `cellVdec` hardware decoder interface, mapped directly to RSX graphics memory via Tiny3D. Features 4-slice frame negotiation (`CAPABILITY_SLICES_PER_FRAME`) with Sunshine/GameStream to eliminate UDP network packet bursts and kernel socket buffer overflows.
 - **Bundled Third-Party Architecture**: Third-party libraries (`moonlight-common-c` and `opus`) are integrated and modified directly in-tree inside `third_party/`, removing external Git submodule dependencies for zero-friction compilation.
 - **OpenSSL Compatibility & Crypto Emulation Layer**: Custom OpenSSL abstraction layer (`src/openssl_compat.c`) translating crypto and TLS operations to PolarSSL/mbedTLS to prevent library symbol collisions on PSL1GHT.
 - **Low-Latency Opus Multistream Audio**: Custom PS3 audio backend (`src/audio/ps3.c`) featuring thread-safe ring buffering, low-latency PCM playback via `sysAudio`, and automatic buffer underflow/overflow recovery.
 - **Full GameStream / Sunshine Protocol Support**: Built-in HTTP/HTTPS pairing pipeline (`src/handshake.c`) supporting client certificate generation, PIN challenge handshake, RTSP stream setup, and session control.
 - **DualShock 3 Input Engine**: Low-latency gamepad input processing via `sysUtil` with analog stick deadzone filtering, mapped buttons, and emergency stream abort hotkeys (`Select + Start + L3 + R3`).
+- **Dynamic Multi-Resolution UI Scaling**: DPI-aware font scaling and coordinate normalization rendering engine supporting 576p, 720p, and 1080p display modes seamlessly without layout distortion.
 - **Real-Time Instrumentation & Performance HUD**: On-screen metrics display monitoring FPS, network RTT, video decode latency, render overhead, and packet loss statistics.
 - **Universal NPDRM Package Build Pipeline**: Native `ppu-strip`, `fself`, and `make_self_npdrm` integration generating retail-signed PKG files compatible with both RPCS3 emulator and physical PS3 consoles (CFW / HEN).
 
