@@ -413,6 +413,12 @@ void stopAudioStream(void) {
 
     AudioCallbacks.stop();
 
+    if (pingThreadStarted) {
+        PltInterruptThread(&udpPingThread);
+        PltJoinThread(&udpPingThread);
+        pingThreadStarted = false;
+    }
+
     PltInterruptThread(&receiveThread);
     if ((AudioCallbacks.capabilities & CAPABILITY_DIRECT_SUBMIT) == 0) {
         // Signal threads waiting on the LBQ

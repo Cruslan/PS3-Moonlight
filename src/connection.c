@@ -5,8 +5,8 @@
 #include <stdarg.h>
 #include <string.h>
 
-#include "video/ps3.h"
-#include "audio/ps3.h"
+#include "video.h"
+#include "audio.h"
 #include "net_logger.h"
 
 static volatile int connection_status = LI_DISCONNECTED;

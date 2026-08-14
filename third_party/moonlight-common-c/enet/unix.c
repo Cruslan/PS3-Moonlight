@@ -914,6 +914,9 @@ enet_socket_wait (ENetSocket socket, enet_uint32 * condition, enet_uint32 timeou
         svcSleepThread(1000);
     }
 #else
+#if defined(__PPU__)
+    if (timeout > 50) timeout = 50;
+#endif
     pollCount = poll (& pollSocket, 1, timeout);
 #endif
 

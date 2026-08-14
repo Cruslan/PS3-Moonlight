@@ -15,14 +15,14 @@
 #include <sysutil/video.h>
 #include <tiny3d.h>
 
-#include "audio/ps3.h"
+#include "audio.h"
 #include "connection.h"
 #include "handshake.h"
 #include "net_logger.h"
 #include "random.h"
 #include "ui.h"
-#include "video/ps3.h"
-#include "input/ps3.h"
+#include "video.h"
+#include "input.h"
 
 SYS_PROCESS_PARAM(1001, 0x100000)
 
@@ -34,6 +34,7 @@ static void sysutil_exit_callback(u64 status, u64 param, void *usrdata) {
   (void)usrdata;
   if (status == SYSUTIL_EXIT_GAME) {
     NLOG("SYSUTIL_EXIT_GAME received. Exiting Moonlight PS3...");
+    LiInterruptConnection();
     ui_stop();
   }
 }
@@ -230,10 +231,15 @@ int main(int argc, char **argv) {
     usleep(50000);
   }
 
-  ui_shutdown();
+  NLOG("Terminating Moonlight PS3 application...");
+  LiStopConnection();
+  ps3audio_stop();
+  ps3video_stop();
   ps3input_stop();
+  ui_shutdown();
   net_logger_shutdown();
   sysUtilUnregisterCallback(0);
+  usleep(100000); // 100ms graceful drain for final network sockets
   netCtlTerm();
   netDeinitialize();
   sysModuleUnload(SYSMODULE_NET);

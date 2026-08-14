@@ -1,4 +1,4 @@
-#include "ps3.h"
+#include "input.h"
 #include <Limelight.h>
 #include <io/pad.h>
 #include <string.h>

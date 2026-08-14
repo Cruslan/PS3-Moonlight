@@ -32,21 +32,24 @@ CC		:= $(PS3DEV)/ppu/bin/ppu-gcc
 
 TARGET		:= moonlight-ps3
 BUILD		:= build
-OFILES		:= src/main.o src/ui.o src/video/ps3.o src/ps3_compat.o src/random.o src/net_logger.o src/openssl_compat.o src/connection.o src/input/ps3.o src/audio/ps3.o src/handshake.o
+TIMESTAMP		:= $(shell date +%Y%m%d_%H%M%S)
+OUT_PKG			:= $(BUILD)/$(TARGET)-$(TIMESTAMP).pkg
+OUT_GNPDRM_PKG	:= $(BUILD)/$(TARGET)-$(TIMESTAMP).gnpdrm.pkg
+OFILES			:= src/main.o src/ui.o src/video.o src/ps3_compat.o src/random.o src/net_logger.o src/openssl_compat.o src/connection.o src/input.o src/audio.o src/handshake.o
 # Enable Cell Broadband Engine CPU optimizations for the PowerPC Processing Unit (PPU)
-CFLAGS		+= -mcpu=cell -O2 -Wall -Wextra -Werror=implicit-function-declaration -MMD -MP -I$(PS3DEV)/ppu/include -I$(PS3DEV)/portlibs/ppu/include -I./src -I./src/video -I./third_party/moonlight-common-c/src -I./third_party/opus/include -include src/openssl_compat.h -fno-lto
-LDFLAGS     += -fno-lto -Wl,--no-undefined -Wl,--as-needed
+CFLAGS			+= -mcpu=cell -O2 -Wall -Wextra -Werror=implicit-function-declaration -MMD -MP -I$(PS3DEV)/ppu/include -I$(PS3DEV)/portlibs/ppu/include -I./src -I./third_party/moonlight-common-c/src -I./third_party/opus/include -include src/openssl_compat.h -fno-lto
+LDFLAGS     	+= -fno-lto -Wl,--no-undefined -Wl,--as-needed
 # Link with polarssl for client-side cryptography. The moonlight-common-c
 # submodule expects mbedtls, but we emulate it via src/openssl_compat.c
 # mapping to PolarSSL to avoid conflicts with the portlib mbedtls library.
-LIBS		:= -L$(PS3DEV)/ppu/lib -L$(PS3DEV)/portlibs/ppu/lib -L./third_party/moonlight-common-c -lmoonlight-common-c -L./third_party/opus -lopus -lfont3d -ltiny3d -lvdec -lsysmodule -lsysutil -lio -lrsx -lgcm_sys -lnet -lnetctl -laudio -lcurl -lpolarssl -lrt -lm -lz
+LIBS			:= -L$(PS3DEV)/ppu/lib -L$(PS3DEV)/portlibs/ppu/lib -L./third_party/moonlight-common-c -lmoonlight-common-c -L./third_party/opus -lopus -lfont3d -ltiny3d -lvdec -lsysmodule -lsysutil -lio -lrsx -lgcm_sys -lnet -lnetctl -laudio -lcurl -lpolarssl -lrt -lm -lz
 
-BUILDDIR	:= $(CURDIR)/$(BUILD)
+BUILDDIR		:= $(CURDIR)/$(BUILD)
 
 all: pkg
 
-LIBCOMMON	:= third_party/moonlight-common-c/libmoonlight-common-c.a
-LIBOPUS		:= third_party/opus/libopus.a
+LIBCOMMON		:= third_party/moonlight-common-c/libmoonlight-common-c.a
+LIBOPUS			:= third_party/opus/libopus.a
 
 # We resolve the absolute path of PS3DEV because make invokes the sub-makefile
 # from a different subdirectory, which would invalidate relative paths.
@@ -54,7 +57,7 @@ $(LIBCOMMON): FORCE
 	$(MAKE) -C third_party/moonlight-common-c -f Makefile.ps3 CC=$(abspath $(PS3DEV))/ppu/bin/ppu-gcc AR=$(abspath $(PS3DEV))/ppu/bin/ppu-ar
 
 $(LIBOPUS): FORCE
-	CFLAGS="-mcpu=cell -O2 -Wall -fno-lto" $(MAKE) -C third_party/opus -f Makefile.unix CC=$(abspath $(PS3DEV))/ppu/bin/ppu-gcc AR=$(abspath $(PS3DEV))/ppu/bin/ppu-ar RANLIB=$(abspath $(PS3DEV))/ppu/bin/ppu-ranlib lib
+	CFLAGS="-mcpu=cell -O2 -Wall -fno-lto -DHAVE_LRINTF -DUSE_ALLOCA" $(MAKE) -C third_party/opus -f Makefile.unix CC=$(abspath $(PS3DEV))/ppu/bin/ppu-gcc AR=$(abspath $(PS3DEV))/ppu/bin/ppu-ar RANLIB=$(abspath $(PS3DEV))/ppu/bin/ppu-ranlib lib
 
 $(TARGET).elf: $(OFILES) $(LIBCOMMON) $(LIBOPUS)
 	$(CC) $(OFILES) $(LDFLAGS) $(LIBS) -o $@
@@ -71,13 +74,15 @@ pkg: $(TARGET).elf
 	$(PS3DEV)/bin/sprxlinker $(BUILD)/$(TARGET).elf
 	@echo "Signing EBOOT.BIN with Retail NPDRM..."
 	$(PS3DEV)/bin/make_self_npdrm $(BUILD)/$(TARGET).elf $(BUILD)/pkg/USRDIR/EBOOT.BIN $(CONTENTID)
-	$(PS3DEV)/bin/fself $(BUILD)/$(TARGET).elf $(TARGET).fake.self
+	$(PS3DEV)/bin/fself $(BUILD)/$(TARGET).elf $(BUILD)/$(TARGET).fake.self
 	$(PS3DEV)/bin/sfo --fromxml $(SFOXML) $(BUILD)/pkg/PARAM.SFO
 	cp $(ICON0) $(BUILD)/pkg/ICON0.PNG || true
-	$(PS3DEV)/bin/pkg --contentid $(CONTENTID) $(BUILD)/pkg/ $(TARGET).pkg
-	cp $(TARGET).pkg $(TARGET).gnpdrm.pkg
+	$(PS3DEV)/bin/pkg --contentid $(CONTENTID) $(BUILD)/pkg/ $(OUT_PKG)
+	cp $(OUT_PKG) $(OUT_GNPDRM_PKG)
 	@echo "Finalizing PKG..."
-	$(PS3DEV)/bin/package_finalize $(TARGET).gnpdrm.pkg 2>/dev/null || true
+	$(PS3DEV)/bin/package_finalize $(OUT_GNPDRM_PKG) 2>/dev/null || true
+	@echo "Built package (Standard): $(OUT_PKG)"
+	@echo "Built package (GNPDRM):   $(OUT_GNPDRM_PKG)"
 
 clean:
 	@echo "Cleaning build artifacts and temporary files..."

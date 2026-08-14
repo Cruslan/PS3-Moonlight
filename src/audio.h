@@ -1,5 +1,5 @@
-#ifndef AUDIO_PS3_H
-#define AUDIO_PS3_H
+#ifndef AUDIO_H
+#define AUDIO_H
 
 #include <Limelight.h>
 

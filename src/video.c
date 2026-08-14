@@ -13,10 +13,8 @@
 #include <tiny3d.h>
 #include <unistd.h>
 
-// Unused SPS header from libgamestream
-// #include "../../libgamestream/sps.h"
-#include "ps3.h"
-#include "../ui.h"
+#include "video.h"
+#include "ui.h"
 #include <Limelight.h>
 #include <rsx/rsx.h>
 #include <rsx/gcm_sys.h>
@@ -322,7 +320,8 @@ static int ps3_video_setup(int videoFormat, int width, int height,
   config.ppu_thread_prio = 500;
   config.ppu_thread_stack_size = 0x10000;
   config.spu_thread_prio = 250;
-  config.num_spus = 6;
+  // Allocate 2 SPUs for hardware-assisted H.264 video decoding
+  config.num_spus = 2;
 
   static opd32 vdec_callback_opd;
   vdecClosure closure;

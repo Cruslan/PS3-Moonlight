@@ -1,5 +1,5 @@
-#ifndef VIDEO_PS3_H
-#define VIDEO_PS3_H
+#ifndef VIDEO_H
+#define VIDEO_H
 
 #include <Limelight.h>
 

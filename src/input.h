@@ -1,5 +1,5 @@
-#ifndef INPUT_PS3_H
-#define INPUT_PS3_H
+#ifndef INPUT_H
+#define INPUT_H
 
 #include <io/pad.h>
 

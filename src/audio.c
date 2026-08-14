@@ -1,4 +1,4 @@
-#include "ps3.h"
+#include "audio.h"
 #include <stdio.h>
 #include <audio/audio.h>
 #include <sys/thread.h>
@@ -108,6 +108,10 @@ static int rb_read(float* data, int num_floats) {
     return 1;
 }
 
+/* Initialization state tracking flags */
+static int audio_system_initialized = 0;
+static int audio_thread_started = 0;
+
 /**
  * High-priority audio playback thread loop.
  * It waits for the PS3 audio notification queue to signal that a block in the
@@ -120,8 +124,12 @@ static void audio_loop(void* arg) {
     float temp_block[AUDIO_CHANNELS * AUDIO_BLOCK_SAMPLES];
     
     while (active_audio_thread) {
-        /* Timeout is 50,000 microseconds (50ms) to ensure thread can exit quickly on shutdown */
-        if (sysEventQueueReceive(audio_queue, &event, 50000) == 0) {
+        /* Timeout is 20,000 microseconds (20ms) to ensure thread can exit quickly on shutdown */
+        if (sysEventQueueReceive(audio_queue, &event, 20000) == 0) {
+            if (!active_audio_thread || !audio_cfg.audioDataStart || audio_cfg.numBlocks == 0) {
+                break;
+            }
+
             /* Compute the target hardware buffer address for the current block */
             float* buffer_addr = (float*)((u64)audio_cfg.audioDataStart + 
                                 (current_block * AUDIO_CHANNELS * AUDIO_BLOCK_SAMPLES * sizeof(float)));
@@ -146,11 +154,16 @@ static void audio_loop(void* arg) {
  * Clean up the audio renderer, stopping threads, closing ports, and freeing resources.
  */
 static void ps3_renderer_cleanup() {
+    if (!audio_system_initialized) return;
+
     active_audio_thread = 0;
     
-    /* Wait for the playback thread to terminate cleanly */
-    u64 retval;
-    sysThreadJoin(audio_thread, &retval);
+    if (audio_thread_started) {
+        /* Wait for the playback thread to terminate cleanly */
+        u64 retval;
+        sysThreadJoin(audio_thread, &retval);
+        audio_thread_started = 0;
+    }
     
     /* Stop audio port transmission */
     audioPortStop(audio_port);
@@ -170,6 +183,8 @@ static void ps3_renderer_cleanup() {
     }
     
     audioQuit();
+    memset(&audio_cfg, 0, sizeof(audio_cfg));
+    audio_system_initialized = 0;
 }
 
 /**
@@ -287,6 +302,8 @@ static int ps3_renderer_init(int audioConfiguration, const POPUS_MULTISTREAM_CON
         return -1;
     }
     
+    audio_thread_started = 1;
+    audio_system_initialized = 1;
     return 0;
 }
 
@@ -327,7 +344,7 @@ void ps3audio_start() {
 }
 
 void ps3audio_stop() {
-  /* Helper function matching interface. Thread stopping is handled in cleanup */
+  ps3_renderer_cleanup();
 }
 
 unsigned int ps3audio_get_decoded_packets() {

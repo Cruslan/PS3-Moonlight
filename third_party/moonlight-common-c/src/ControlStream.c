@@ -141,7 +141,11 @@ static PPLT_CRYPTO_CONTEXT decryptionCtx;
 #define IDX_DS_ADAPTIVE_TRIGGERS 12
 
 #define CONTROL_STREAM_TIMEOUT_SEC 10
+#if defined(__PPU__)
+#define CONTROL_STREAM_LINGER_TIMEOUT_SEC 0
+#else
 #define CONTROL_STREAM_LINGER_TIMEOUT_SEC 2
+#endif
 
 static const short packetTypesGen3[] = {
     0x1407, // Request IDR frame

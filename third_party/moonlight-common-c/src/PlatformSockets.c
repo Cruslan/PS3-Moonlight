@@ -89,8 +89,8 @@ int setNonFatalRecvTimeoutMs(SOCKET s, int timeoutMs) {
     // losing some data in a very rare case is fine, especially because we get to
     // halve the number of syscalls per packet by avoiding select().
     return setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeoutMs, sizeof(timeoutMs));
-#elif defined(__WIIU__) || defined(__3DS__)
-    // timeouts aren't supported on Wii U or 3DS
+#elif defined(__WIIU__) || defined(__3DS__) || defined(__PPU__)
+    // timeouts via SO_RCVTIMEO are not reliable on Wii U, 3DS, or PS3 libnet; use pollSockets() instead
     return -1;
 #else
     struct timeval val;
@@ -192,6 +192,18 @@ int recvUdpSocket(SOCKET s, char* buffer, int size, bool useSelect) {
     int err;
 
     do {
+#if defined(__PPU__)
+        // On PS3 libnet, SO_RCVTIMEO is unsupported and raw recvfrom blocks kernel threads indefinitely.
+        // Always poll with 50ms timeout so worker threads can promptly notice cancellations and exit.
+        struct pollfd pfd;
+        pfd.fd = s;
+        pfd.events = POLLIN;
+        err = pollSockets(&pfd, 1, 50);
+        if (err <= 0) {
+            return err;
+        }
+        err = (int)recvfrom(s, buffer, size, 0, NULL, NULL);
+#else
         if (useSelect) {
             struct pollfd pfd;
 
@@ -227,6 +239,7 @@ int recvUdpSocket(SOCKET s, char* buffer, int size, bool useSelect) {
                 return 0;
             }
         }
+#endif
 
     // We may receive an error due to a previous ICMP Port Unreachable error received
     // by this socket. We want to ignore those and continue reading. If the remote party

@@ -8,10 +8,10 @@
 #include <sys/mutex.h>
 #include <unistd.h>
 #include <lv2/systime.h>
-#include "input/ps3.h"
+#include "input.h"
 #include <Limelight.h>
-#include "video/ps3.h"
-#include "audio/ps3.h"
+#include "video.h"
+#include "audio.h"
 
 static sys_ppu_thread_t ui_thread;
 static int ui_thread_started = 0;
@@ -28,7 +28,7 @@ static volatile int ui_state = UI_STATE_IP_ENTRY;
 #define SF(s) ((u32)(((float)(s) * scale_font < 8.0f) ? 8.0f : ((float)(s) * scale_font)))
 
 // IP state
-static int ip_octets[4] = {192, 168, 1, 1};
+static int ip_octets[4] = {10, 42, 0, 1};
 static int ui_fps = 60;
 static int ui_bitrate_options[] = {5000, 10000};
 static int ui_bitrate_idx = 1; // Default 10 Mbps
