@@ -55,14 +55,15 @@ static int ui_vsync = 1; // Default: VSync ON (1)
 #define MAIN_MENU_ITEM_COUNT 3
 static int active_main_item = 0; // 0: Sunshine Host IP, 1: Configure Settings, 2: Connect/Pair
 
-#define SETTINGS_ITEM_COUNT 6
-static int active_settings_item = 0; // 0: FPS, 1: Bitrate, 2: VSync, 3: Stats, 4: Verbose, 5: Back
+#define SETTINGS_ITEM_COUNT 7
+static int active_settings_item = 0; // 0: FPS, 1: Bitrate, 2: Mouse, 3: VSync, 4: Stats, 5: Verbose, 6: Back
 
 static int frames_drawn_this_sec = 0;
 static int ui_fps_actual = 0;
 static u64 last_ui_time = 0;
 static int show_stats = 0; // Default: Stats OFF (0)
 static int ui_verbose = 0; // Default: Verbose Logging OFF (0)
+static int ui_mouse_mode = 0; // Default: 0 = Game Mode (Relative), 1 = Desktop Mode (Absolute)
 
 // OSK management state
 static sys_mem_container_t osk_container;
@@ -83,6 +84,7 @@ void ui_stop() { ui_running = 0; }
 int ui_get_vsync() { return ui_vsync; }
 int ui_get_show_stats() { return show_stats; }
 int ui_get_verbose() { return ui_verbose; }
+int ui_get_mouse_mode(void) { return ui_mouse_mode; }
 
 static char pairing_pin_str[16] = "";
 
@@ -174,6 +176,7 @@ void ui_save_settings(void) {
         fprintf(f, "host_ip=%s\n", target_ip_str);
         fprintf(f, "fps=%d\n", ui_fps);
         fprintf(f, "bitrate_idx=%d\n", ui_bitrate_idx);
+        fprintf(f, "mouse_mode=%d\n", ui_mouse_mode);
         fprintf(f, "vsync=%d\n", ui_vsync ? 1 : 0);
         fprintf(f, "stats=%d\n", show_stats ? 1 : 0);
         fprintf(f, "verbose=%d\n", ui_verbose ? 1 : 0);
@@ -214,6 +217,9 @@ void ui_load_settings(void) {
             } else if (strcmp(key, "bitrate_idx") == 0) {
                 int v = atoi(val);
                 if (v >= 0 && v < NUM_BITRATE_OPTIONS) ui_bitrate_idx = v;
+            } else if (strcmp(key, "mouse_mode") == 0) {
+                int v = atoi(val);
+                if (v == 0 || v == 1) ui_mouse_mode = v;
             } else if (strcmp(key, "vsync") == 0) {
                 ui_vsync = (atoi(val) != 0);
             } else if (strcmp(key, "stats") == 0) {
@@ -848,25 +854,31 @@ static void ui_loop(void *arg) {
                     ui_save_settings();
                 }
             } else if (active_settings_item == 2) {
+                // Mouse Mode toggle (0: Game / Relative <-> 1: Desktop / Absolute)
+                if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & LEFT_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
+                    ui_mouse_mode = !ui_mouse_mode;
+                    ui_save_settings();
+                }
+            } else if (active_settings_item == 3) {
                 // VSync toggle
                 if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & LEFT_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
                     ui_vsync = !ui_vsync;
                     gcmSetFlipMode(ui_vsync ? GCM_FLIP_VSYNC : GCM_FLIP_HSYNC);
                     ui_save_settings();
                 }
-            } else if (active_settings_item == 3) {
+            } else if (active_settings_item == 4) {
                 // Stats overlay toggle
                 if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & LEFT_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
                     show_stats = !show_stats;
                     ui_save_settings();
                 }
-            } else if (active_settings_item == 4) {
+            } else if (active_settings_item == 5) {
                 // Verbose logging toggle
                 if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & LEFT_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
                     ui_verbose = !ui_verbose;
                     ui_save_settings();
                 }
-            } else if (active_settings_item == 5) {
+            } else if (active_settings_item == 6) {
                 // Back to Main Menu
                 if (pad.buttons_pressed & A_FLAG) {
                     ui_save_settings();
@@ -1014,11 +1026,11 @@ static void ui_loop(void *arg) {
                 SetFontColor(0xff9e9e9e, 0);
                 int kbps = ui_bitrate_options[ui_bitrate_idx];
                 if (kbps % 1000 == 0) {
-                    DrawFormatString(SX(60), SY(225), "Current: %d FPS  |  %d Mbps  |  VSync: %s  |  Stats: %s", 
-                                     ui_fps, kbps / 1000, ui_vsync ? "ON" : "OFF", show_stats ? "ON" : "OFF");
+                    DrawFormatString(SX(60), SY(225), "Current: %d FPS  |  %d Mbps  |  Mouse: %s  |  VSync: %s", 
+                                     ui_fps, kbps / 1000, (ui_mouse_mode == 0) ? "GAME" : "DESKTOP", ui_vsync ? "ON" : "OFF");
                 } else {
-                    DrawFormatString(SX(60), SY(225), "Current: %d FPS  |  %.1f Mbps  |  VSync: %s  |  Stats: %s", 
-                                     ui_fps, (float)kbps / 1000.0f, ui_vsync ? "ON" : "OFF", show_stats ? "ON" : "OFF");
+                    DrawFormatString(SX(60), SY(225), "Current: %d FPS  |  %.1f Mbps  |  Mouse: %s  |  VSync: %s", 
+                                     ui_fps, (float)kbps / 1000.0f, (ui_mouse_mode == 0) ? "GAME" : "DESKTOP", ui_vsync ? "ON" : "OFF");
                 }
 
                 // Row 2: Connect / Pair Action Button
@@ -1037,50 +1049,57 @@ static void ui_loop(void *arg) {
                 DrawString(SX(40), SY(18), "Moonlight PS3  -  Stream Settings");
 
                 // Row 0: Target FPS
-                SetFontSize(SF(22), SF(22));
+                SetFontSize(SF(20), SF(20));
                 SetFontColor((active_settings_item == 0) ? 0xff82b1ff : 0xffb0bec5, 0);
-                DrawString(SX(60), SY(115), "Target FPS:");
+                DrawString(SX(60), SY(105), "Target FPS:");
                 
                 SetFontColor((active_settings_item == 0) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawFormatString(SX(430), SY(115), "[ %d FPS ]", ui_fps);
+                DrawFormatString(SX(430), SY(105), "[ %d FPS ]", ui_fps);
 
                 // Row 1: Target Bitrate
                 SetFontColor((active_settings_item == 1) ? 0xff82b1ff : 0xffb0bec5, 0);
-                DrawString(SX(60), SY(155), "Target Bitrate:");
+                DrawString(SX(60), SY(140), "Target Bitrate:");
                 
                 SetFontColor((active_settings_item == 1) ? 0xff82b1ff : 0xffffffff, 0);
                 int kbps = ui_bitrate_options[ui_bitrate_idx];
                 if (kbps % 1000 == 0) {
-                    DrawFormatString(SX(430), SY(155), "[ %d Mbps ]", kbps / 1000);
+                    DrawFormatString(SX(430), SY(140), "[ %d Mbps ]", kbps / 1000);
                 } else {
-                    DrawFormatString(SX(430), SY(155), "[ %.1f Mbps ]", (float)kbps / 1000.0f);
+                    DrawFormatString(SX(430), SY(140), "[ %.1f Mbps ]", (float)kbps / 1000.0f);
                 }
 
-                // Row 2: VSync Mode
+                // Row 2: Mouse Mode
                 SetFontColor((active_settings_item == 2) ? 0xff82b1ff : 0xffb0bec5, 0);
-                DrawString(SX(60), SY(195), "VSync Mode:");
+                DrawString(SX(60), SY(175), "Mouse Mode:");
                 
                 SetFontColor((active_settings_item == 2) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawFormatString(SX(430), SY(195), "[ %s ]", ui_vsync ? "ON (Smooth 60Hz)" : "OFF (Low Latency)");
+                DrawFormatString(SX(430), SY(175), "[ %s ]", (ui_mouse_mode == 0) ? "GAME (Relative / 3D)" : "DESKTOP (Absolute / 1:1)");
 
-                // Row 3: Stats Overlay
+                // Row 3: VSync Mode
                 SetFontColor((active_settings_item == 3) ? 0xff82b1ff : 0xffb0bec5, 0);
-                DrawString(SX(60), SY(235), "Stats Overlay:");
+                DrawString(SX(60), SY(210), "VSync Mode:");
                 
                 SetFontColor((active_settings_item == 3) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawFormatString(SX(430), SY(235), "[ %s ]", show_stats ? "ON" : "OFF");
+                DrawFormatString(SX(430), SY(210), "[ %s ]", ui_vsync ? "ON (Smooth 60Hz)" : "OFF (Low Latency)");
 
-                // Row 4: Verbose Logging
+                // Row 4: Stats Overlay
                 SetFontColor((active_settings_item == 4) ? 0xff82b1ff : 0xffb0bec5, 0);
-                DrawString(SX(60), SY(275), "Verbose Logging:");
+                DrawString(SX(60), SY(245), "Stats Overlay:");
                 
                 SetFontColor((active_settings_item == 4) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawFormatString(SX(430), SY(275), "[ %s ]", ui_verbose ? "ON" : "OFF");
+                DrawFormatString(SX(430), SY(245), "[ %s ]", show_stats ? "ON" : "OFF");
 
-                // Row 5: Back to Main Menu Button
-                SetFontSize(SF(22), SF(22));
+                // Row 5: Verbose Logging
+                SetFontColor((active_settings_item == 5) ? 0xff82b1ff : 0xffb0bec5, 0);
+                DrawString(SX(60), SY(280), "Verbose Logging:");
+                
                 SetFontColor((active_settings_item == 5) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawString(SX(60), SY(335), "[ BACK TO MAIN MENU ]");
+                DrawFormatString(SX(430), SY(280), "[ %s ]", ui_verbose ? "ON" : "OFF");
+
+                // Row 6: Back to Main Menu Button
+                SetFontSize(SF(22), SF(22));
+                SetFontColor((active_settings_item == 6) ? 0xff82b1ff : 0xffffffff, 0);
+                DrawString(SX(60), SY(330), "[ BACK TO MAIN MENU ]");
 
                 // Clean controls legend
                 SetFontSize(SF(18), SF(18));
