@@ -1,6 +1,9 @@
 #include "ui.h"
 #include <tiny3d.h>
 #include <libfont.h>
+#include <ft2build.h>
+#include FT_FREETYPE_H
+#include <math.h>
 #include <malloc.h>
 #include <string.h>
 #include <stdio.h>
@@ -387,19 +390,229 @@ static void draw_background_gradient() {
     tiny3d_End();
 }
 
+// FreeType font engine state
+static FT_Library ft_library = NULL;
+static FT_Face ft_face = NULL;
+static int font_is_ttf = 0;
+
+static void render_ps_button_glyph(u8 chr, u8 *bitmap, short *w, short *h, short *y_correction) {
+    *w = 26;
+    *h = 28;
+    *y_correction = 2; // Aligned with baseline
+    
+    float cx = 13.0f;
+    float cy = 14.0f;
+    float r_outer = 11.5f;
+    float r_inner = 9.5f;
+    
+    for (int y = 0; y < 28; y++) {
+        for (int x = 0; x < 26; x++) {
+            float dx = (float)x - cx;
+            float dy = (float)y - cy;
+            float d = sqrtf(dx * dx + dy * dy);
+            float alpha = 0.0f;
+            
+            if (chr == 1) {
+                // Cross (✕) Button Badge
+                if (d <= r_outer && d >= r_inner) {
+                    float edge = (d > r_outer - 0.75f) ? (r_outer - d) / 0.75f : ((d < r_inner + 0.75f) ? (d - r_inner) / 0.75f : 1.0f);
+                    if (edge > 0.0f) alpha = fmaxf(alpha, edge * 220.0f);
+                }
+                if (d < r_inner - 0.8f) {
+                    float dist_d1 = fabsf(dx - dy) / 1.4142f;
+                    float dist_d2 = fabsf(dx + dy) / 1.4142f;
+                    float line_dist = fminf(dist_d1, dist_d2);
+                    if (line_dist < 1.6f && d < 6.5f) {
+                        float cross_alpha = (line_dist < 0.9f) ? 1.0f : (1.6f - line_dist) / 0.7f;
+                        alpha = fmaxf(alpha, cross_alpha * 255.0f);
+                    }
+                }
+            } else if (chr == 2) {
+                // Circle (◯) Button Badge
+                if (d <= r_outer && d >= r_inner) {
+                    float edge = (d > r_outer - 0.75f) ? (r_outer - d) / 0.75f : ((d < r_inner + 0.75f) ? (d - r_inner) / 0.75f : 1.0f);
+                    if (edge > 0.0f) alpha = fmaxf(alpha, edge * 220.0f);
+                }
+                float ir = 5.2f;
+                float dist_ir = fabsf(d - ir);
+                if (dist_ir < 1.6f) {
+                    float ring_alpha = (dist_ir < 0.9f) ? 1.0f : (1.6f - dist_ir) / 0.7f;
+                    alpha = fmaxf(alpha, ring_alpha * 255.0f);
+                }
+            } else if (chr == 3) {
+                // Triangle (△) Button Badge
+                if (d <= r_outer && d >= r_inner) {
+                    float edge = (d > r_outer - 0.75f) ? (r_outer - d) / 0.75f : ((d < r_inner + 0.75f) ? (d - r_inner) / 0.75f : 1.0f);
+                    if (edge > 0.0f) alpha = fmaxf(alpha, edge * 220.0f);
+                }
+                float ty = dy + 1.0f;
+                float dist_bottom = fabsf(ty - 4.0f);
+                float dist_left = fabsf(dx * 0.866f + ty * 0.5f + 1.5f);
+                float dist_right = fabsf(-dx * 0.866f + ty * 0.5f + 1.5f);
+                if (ty <= 4.2f && ty >= -5.5f && fabsf(dx) <= (ty + 5.5f) * 0.65f + 1.2f) {
+                    float tri_dist = fminf(dist_bottom, fminf(dist_left, dist_right));
+                    if (tri_dist < 1.5f) {
+                        float tri_alpha = (tri_dist < 0.8f) ? 1.0f : (1.5f - tri_dist) / 0.7f;
+                        alpha = fmaxf(alpha, tri_alpha * 255.0f);
+                    }
+                }
+            } else if (chr == 4) {
+                // Square (◻) Button Badge
+                if (d <= r_outer && d >= r_inner) {
+                    float edge = (d > r_outer - 0.75f) ? (r_outer - d) / 0.75f : ((d < r_inner + 0.75f) ? (d - r_inner) / 0.75f : 1.0f);
+                    if (edge > 0.0f) alpha = fmaxf(alpha, edge * 220.0f);
+                }
+                float max_d = fmaxf(fabsf(dx), fabsf(dy));
+                float sq_dist = fabsf(max_d - 4.8f);
+                if (sq_dist < 1.5f && max_d <= 5.5f) {
+                    float sq_alpha = (sq_dist < 0.8f) ? 1.0f : (1.5f - sq_dist) / 0.7f;
+                    alpha = fmaxf(alpha, sq_alpha * 255.0f);
+                }
+            } else if (chr == 5) {
+                // D-Pad Up/Down (↕) Icon
+                if (fabsf(dx) <= 2.2f && fabsf(dy) <= 8.5f) {
+                    alpha = 240.0f;
+                }
+                if (dy < -2.0f && dy >= -9.5f) {
+                    float arrow_w = (dy + 9.5f) * 0.9f;
+                    if (fabsf(dx) <= arrow_w + 0.8f) {
+                        alpha = 255.0f;
+                    }
+                }
+                if (dy > 2.0f && dy <= 9.5f) {
+                    float arrow_w = (9.5f - dy) * 0.9f;
+                    if (fabsf(dx) <= arrow_w + 0.8f) {
+                        alpha = 255.0f;
+                    }
+                }
+            } else if (chr == 6) {
+                // Heart (♥) Symbol
+                float d_left = sqrtf((dx + 4.0f) * (dx + 4.0f) + (dy + 2.5f) * (dy + 2.5f));
+                float d_right = sqrtf((dx - 4.0f) * (dx - 4.0f) + (dy + 2.5f) * (dy + 2.5f));
+                if (d_left <= 4.8f) {
+                    float edge = (d_left > 4.0f) ? (4.8f - d_left) / 0.8f : 1.0f;
+                    alpha = fmaxf(alpha, edge * 255.0f);
+                }
+                if (d_right <= 4.8f) {
+                    float edge = (d_right > 4.0f) ? (4.8f - d_right) / 0.8f : 1.0f;
+                    alpha = fmaxf(alpha, edge * 255.0f);
+                }
+                if (dy >= -2.5f && dy <= 8.5f) {
+                    float max_w = (8.5f - dy) * 0.77f;
+                    if (fabsf(dx) <= max_w + 0.8f) {
+                        float edge = (fabsf(dx) > max_w) ? (max_w + 0.8f - fabsf(dx)) / 0.8f : 1.0f;
+                        alpha = fmaxf(alpha, edge * 255.0f);
+                    }
+                }
+            }
+            
+            if (alpha > 255.0f) alpha = 255.0f;
+            bitmap[y * 32 + x] = (u8)alpha;
+        }
+    }
+}
+
+static void ttf_render_callback(u8 chr, u8 *bitmap, short *w, short *h, short *y_correction) {
+    memset(bitmap, 0, 32 * 32);
+    *w = 0;
+    *h = 0;
+    *y_correction = 0;
+    
+    // Check for Custom Glyph slots (1: Cross, 2: Circle, 3: Triangle, 4: Square, 5: D-Pad, 6: Heart)
+    if (chr >= 1 && chr <= 6) {
+        render_ps_button_glyph(chr, bitmap, w, h, y_correction);
+        return;
+    }
+    
+    if (!ft_face) return;
+    
+    // Custom spacing for space character
+    if (chr == ' ') {
+        *w = 10;
+        *h = 1;
+        *y_correction = 0;
+        return;
+    }
+    
+    FT_UInt glyph_index = FT_Get_Char_Index(ft_face, (FT_ULong)chr);
+    if (glyph_index == 0) return;
+    
+    if (FT_Load_Glyph(ft_face, glyph_index, FT_LOAD_DEFAULT)) return;
+    if (FT_Render_Glyph(ft_face->glyph, FT_RENDER_MODE_NORMAL)) return;
+    
+    FT_GlyphSlot slot = ft_face->glyph;
+    int bw = slot->bitmap.width;
+    int bh = slot->bitmap.rows;
+    if (bw > 32) bw = 32;
+    if (bh > 32) bh = 32;
+    
+    *w = (short)(slot->advance.x >> 6);
+    if (*w <= 0) *w = (short)(bw + 2);
+    *h = (short)bh;
+    *y_correction = (short)(26 - slot->bitmap_top);
+    if (*y_correction < 0) *y_correction = 0;
+    
+    for (int y = 0; y < bh; y++) {
+        for (int x = 0; x < bw; x++) {
+            u8 val = slot->bitmap.buffer[y * slot->bitmap.pitch + x];
+            bitmap[y * 32 + x] = val;
+        }
+    }
+}
+
+static void ui_init_fonts() {
+    ResetFont();
+    font_is_ttf = 0;
+    
+    // PlayStation 3 internal system fonts (ordered by preference)
+    static const char *font_candidates[] = {
+        "/dev_flash/data/font/SCE-PS3-RD-R-LATIN.TTF",
+        "/dev_flash/data/font/SCE-PS3-SR-R-LATIN.TTF",
+        "/dev_flash/data/font/SCE-PS3-VR-R-LATIN.TTF",
+        "/dev_flash/data/font/SCE-PS3-DH-R-CGB.TTF",
+        NULL
+    };
+    
+    if (FT_Init_FreeType(&ft_library) == 0) {
+        for (int i = 0; font_candidates[i] != NULL; i++) {
+            if (FT_New_Face(ft_library, font_candidates[i], 0, &ft_face) == 0) {
+                FT_Set_Pixel_Sizes(ft_face, 0, 30);
+                
+                texture_mem = tiny3d_AllocTexture(1024 * 1024);
+                if (texture_mem) {
+                    AddFontFromTTF((u8 *)texture_mem, 1, 127, 32, 32, ttf_render_callback);
+                    font_is_ttf = 1;
+                    char log_buf[96];
+                    snprintf(log_buf, sizeof(log_buf), "Font: Loaded FreeType TTF (%s)", font_candidates[i]);
+                    ui_push_log(log_buf);
+                    break;
+                }
+            }
+        }
+    }
+    
+    // Fallback to built-in bitmap font if TTF failed or files unavailable
+    if (!font_is_ttf) {
+        if (!texture_mem) {
+            texture_mem = tiny3d_AllocTexture(64 * 1024);
+        }
+        if (texture_mem) {
+            AddFontFromBitmapArray((u8 *)font_8x8_basic, (u8 *)texture_mem, 32, 127, 8, 8, 1, BIT7_FIRST_PIXEL);
+            ui_push_log("Font: Loaded fallback 8x8 bitmap font");
+        }
+    }
+    
+    SetCurrentFont(0);
+    SetFontSize(SF(16), SF(16));
+    SetFontColor(0xffffffff, 0x00000000);
+}
+
 static void ui_loop(void *arg) {
     (void)arg;
     ps3_pad_state_t pad;
     
     tiny3d_Init(1024 * 1024); // 1MB vertex buffer
-    texture_mem = tiny3d_AllocTexture(64 * 1024);
-    if (texture_mem) {
-        ResetFont();
-        AddFontFromBitmapArray((u8 *)font_8x8_basic, (u8 *)texture_mem, 32, 127, 8, 8, 1, BIT7_FIRST_PIXEL);
-        SetCurrentFont(0);
-        SetFontSize(16, 16);
-        SetFontColor(0xffffffff, 0x00000000);
-    }
+    ui_init_fonts();
     
     // Enable Alpha Test and Blending to eliminate solid black texture boxes around font glyphs
     tiny3d_AlphaTest(1, 0, TINY3D_ALPHA_FUNC_GREATER);
@@ -481,6 +694,7 @@ static void ui_loop(void *arg) {
                 // VSync toggle
                 if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & LEFT_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
                     ui_vsync = !ui_vsync;
+                    gcmSetFlipMode(ui_vsync ? GCM_FLIP_VSYNC : GCM_FLIP_HSYNC);
                 }
             } else if (active_settings_item == 3) {
                 // Stats overlay toggle
@@ -535,13 +749,41 @@ static void ui_loop(void *arg) {
         if (ui_state == UI_STATE_STREAMING) {
             ps3video_draw();
             
-            // Draw Video FPS Counter (Top Left) if enabled
+            // Draw Video Performance Stats HUD (Top Left) if enabled
             if (show_stats) {
-                SetFontSize(SF(16), SF(16));
-                SetFontColor(0xff00ff00, 0); // Neo-Matrix green
                 float sx = SX(30);
                 float sy = SY(30);
                 float line_h = SY(20);
+                float hud_w = SX(360);
+                float hud_h = 11.5f * line_h;
+
+                // Semi-transparent dark HUD container background (#121212 with 85% alpha)
+                tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
+                tiny3d_VertexPos(sx - SX(10), sy - SY(10), 65535);
+                tiny3d_VertexFcolor(0.07f, 0.07f, 0.07f, 0.85f);
+                tiny3d_VertexPos(sx + hud_w, sy - SY(10), 65535);
+                tiny3d_VertexFcolor(0.07f, 0.07f, 0.07f, 0.85f);
+                tiny3d_VertexPos(sx - SX(10), sy + hud_h, 65535);
+                tiny3d_VertexFcolor(0.07f, 0.07f, 0.07f, 0.85f);
+                tiny3d_VertexPos(sx + hud_w, sy + hud_h, 65535);
+                tiny3d_VertexFcolor(0.07f, 0.07f, 0.07f, 0.85f);
+                tiny3d_End();
+
+                // Top Accent Line (#3F51B5)
+                tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
+                tiny3d_VertexPos(sx - SX(10), sy - SY(10), 65535);
+                tiny3d_VertexFcolor(0.247f, 0.318f, 0.710f, 1.0f);
+                tiny3d_VertexPos(sx + hud_w, sy - SY(10), 65535);
+                tiny3d_VertexFcolor(0.247f, 0.318f, 0.710f, 1.0f);
+                tiny3d_VertexPos(sx - SX(10), sy - SY(8), 65535);
+                tiny3d_VertexFcolor(0.247f, 0.318f, 0.710f, 1.0f);
+                tiny3d_VertexPos(sx + hud_w, sy - SY(8), 65535);
+                tiny3d_VertexFcolor(0.247f, 0.318f, 0.710f, 1.0f);
+                tiny3d_End();
+
+                SetCurrentFont(0);
+                SetFontSize(SF(16), SF(16));
+                SetFontColor(0x00ff00ff, 0); // Pure Matrix Green (RGBA: RR=0, GG=255, BB=0, AA=255)
 
                 DrawFormatString(sx, sy + 0 * line_h, "Rendered FPS: %d", ps3video_get_current_fps());
                 DrawFormatString(sx, sy + 1 * line_h, "Decoded FPS: %d", ps3video_get_decoded_fps());
@@ -554,41 +796,42 @@ static void ui_loop(void *arg) {
                 DrawFormatString(sx, sy + 8 * line_h, "Target FPS: %d FPS", ui_get_fps());
                 DrawFormatString(sx, sy + 9 * line_h, "Bitrate: %d Mbps", ui_get_bitrate() / 1000);
                 
-                /* Draw temporary visual debug info for audio stream activity */
-                u32 audio_pkts = ps3audio_get_decoded_packets();
+                /* Real-time Hardware Telemetry Stream Link Activity Monitor */
+                u32 total_frames = ps3video_get_total_decoded_frames();
+                int pulse_phase = (int)((total_frames / 4) % 4);
                 const char* spinner = "";
-                switch ((audio_pkts / 8) % 4) {
+                switch (pulse_phase) {
                     case 0: spinner = "[ - ]"; break;
                     case 1: spinner = "[ \\ ]"; break;
                     case 2: spinner = "[ | ]"; break;
                     case 3: spinner = "[ / ]"; break;
                 }
-                DrawFormatString(sx, sy + 10 * line_h, "Audio Packets: %u %s", audio_pkts, spinner);
+                DrawFormatString(sx, sy + 10 * line_h, "Stream Link: ACTIVE %s", spinner);
             }
         } else {
             draw_background_gradient();
             
             if (ui_state == UI_STATE_IP_ENTRY) {
                 // Title inside #3F51B5 header bar
-                SetFontSize(SF(24), SF(24));
+                SetFontSize(SF(26), SF(26));
                 SetFontColor(0xffffffff, 0);
-                DrawString(SX(40), SY(20), "Moonlight PS3");
+                DrawString(SX(40), SY(18), "Moonlight PS3");
                 
                 // Row 0: Sunshine Host
-                SetFontSize(SF(22), SF(22));
+                SetFontSize(SF(24), SF(24));
                 SetFontColor((active_main_item == 0) ? 0xff82b1ff : 0xffb0bec5, 0);
-                float next_x = DrawString(SX(60), SY(130), "Sunshine Host:");
+                float next_x = DrawString(SX(60), SY(125), "Sunshine Host:");
                 
                 SetFontColor((active_main_item == 0) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawFormatString(next_x + SX(20), SY(130), "[ %s ]", target_ip_str);
+                DrawFormatString(next_x + SX(20), SY(125), "[ %s ]", target_ip_str);
 
                 // Row 1: Settings Sub-menu Link
-                SetFontSize(SF(22), SF(22));
+                SetFontSize(SF(24), SF(24));
                 SetFontColor((active_main_item == 1) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawString(SX(60), SY(190), "[ CONFIGURE STREAM SETTINGS ]");
+                DrawString(SX(60), SY(185), "[ CONFIGURE STREAM SETTINGS ]");
                 
                 // Active settings summary preview
-                SetFontSize(SF(16), SF(16));
+                SetFontSize(SF(18), SF(18));
                 SetFontColor(0xff9e9e9e, 0);
                 int kbps = ui_bitrate_options[ui_bitrate_idx];
                 if (kbps % 1000 == 0) {
@@ -600,82 +843,82 @@ static void ui_loop(void *arg) {
                 }
 
                 // Row 2: Connect / Pair Action Button
-                SetFontSize(SF(22), SF(22));
+                SetFontSize(SF(24), SF(24));
                 SetFontColor((active_main_item == 2) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawString(SX(60), SY(285), "[ CONNECT / PAIR TO HOST ]");
+                DrawString(SX(60), SY(280), "[ CONNECT / PAIR TO HOST ]");
 
                 // Clean controls legend
-                SetFontSize(SF(16), SF(16));
+                SetFontSize(SF(18), SF(18));
                 SetFontColor(0xff9e9e9e, 0);
-                DrawString(SX(60), SY(450), "[UP/DOWN]: Navigate   |   [X]: Select");
+                DrawString(SX(60), SY(445), "\x05 Navigate   |   \x01 Select");
             } else if (ui_state == UI_STATE_SETTINGS) {
                 // Title inside #3F51B5 header bar
-                SetFontSize(SF(24), SF(24));
+                SetFontSize(SF(26), SF(26));
                 SetFontColor(0xffffffff, 0);
-                DrawString(SX(40), SY(20), "Moonlight PS3  -  Stream Settings");
+                DrawString(SX(40), SY(18), "Moonlight PS3  -  Stream Settings");
 
                 // Row 0: Target FPS
-                SetFontSize(SF(20), SF(20));
+                SetFontSize(SF(22), SF(22));
                 SetFontColor((active_settings_item == 0) ? 0xff82b1ff : 0xffb0bec5, 0);
-                DrawString(SX(60), SY(120), "Target FPS:");
+                DrawString(SX(60), SY(115), "Target FPS:");
                 
                 SetFontColor((active_settings_item == 0) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawFormatString(SX(430), SY(120), "[ %d FPS ]", ui_fps);
+                DrawFormatString(SX(430), SY(115), "[ %d FPS ]", ui_fps);
 
                 // Row 1: Target Bitrate
                 SetFontColor((active_settings_item == 1) ? 0xff82b1ff : 0xffb0bec5, 0);
-                DrawString(SX(60), SY(160), "Target Bitrate:");
+                DrawString(SX(60), SY(155), "Target Bitrate:");
                 
                 SetFontColor((active_settings_item == 1) ? 0xff82b1ff : 0xffffffff, 0);
                 int kbps = ui_bitrate_options[ui_bitrate_idx];
                 if (kbps % 1000 == 0) {
-                    DrawFormatString(SX(430), SY(160), "[ %d Mbps ]", kbps / 1000);
+                    DrawFormatString(SX(430), SY(155), "[ %d Mbps ]", kbps / 1000);
                 } else {
-                    DrawFormatString(SX(430), SY(160), "[ %.1f Mbps ]", (float)kbps / 1000.0f);
+                    DrawFormatString(SX(430), SY(155), "[ %.1f Mbps ]", (float)kbps / 1000.0f);
                 }
 
                 // Row 2: VSync Mode
                 SetFontColor((active_settings_item == 2) ? 0xff82b1ff : 0xffb0bec5, 0);
-                DrawString(SX(60), SY(200), "VSync Mode:");
+                DrawString(SX(60), SY(195), "VSync Mode:");
                 
                 SetFontColor((active_settings_item == 2) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawFormatString(SX(430), SY(200), "[ %s ]", ui_vsync ? "ON (Smooth 60Hz)" : "OFF (Low Latency)");
+                DrawFormatString(SX(430), SY(195), "[ %s ]", ui_vsync ? "ON (Smooth 60Hz)" : "OFF (Low Latency)");
 
                 // Row 3: Stats Overlay
                 SetFontColor((active_settings_item == 3) ? 0xff82b1ff : 0xffb0bec5, 0);
-                DrawString(SX(60), SY(240), "Stats Overlay:");
+                DrawString(SX(60), SY(235), "Stats Overlay:");
                 
                 SetFontColor((active_settings_item == 3) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawFormatString(SX(430), SY(240), "[ %s ]", show_stats ? "ON" : "OFF");
+                DrawFormatString(SX(430), SY(235), "[ %s ]", show_stats ? "ON" : "OFF");
 
                 // Row 4: Verbose Logging
                 SetFontColor((active_settings_item == 4) ? 0xff82b1ff : 0xffb0bec5, 0);
-                DrawString(SX(60), SY(280), "Verbose Logging:");
+                DrawString(SX(60), SY(275), "Verbose Logging:");
                 
                 SetFontColor((active_settings_item == 4) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawFormatString(SX(430), SY(280), "[ %s ]", ui_verbose ? "ON" : "OFF");
+                DrawFormatString(SX(430), SY(275), "[ %s ]", ui_verbose ? "ON" : "OFF");
 
                 // Row 5: Back to Main Menu Button
-                SetFontSize(SF(20), SF(20));
+                SetFontSize(SF(22), SF(22));
                 SetFontColor((active_settings_item == 5) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawString(SX(60), SY(340), "[ BACK TO MAIN MENU ]");
+                DrawString(SX(60), SY(335), "[ BACK TO MAIN MENU ]");
 
                 // Clean controls legend
-                SetFontSize(SF(16), SF(16));
+                SetFontSize(SF(18), SF(18));
                 SetFontColor(0xff9e9e9e, 0);
-                DrawString(SX(60), SY(450), "[UP/DOWN]: Navigate   |   [X]: Select / Change   |   (O): Back");
+                DrawString(SX(60), SY(445), "\x05 Navigate   |   \x01 Select / Change   |   \x02 Back");
             } else if (ui_state == UI_STATE_PAIRING) {
-                SetFontSize(SF(24), SF(24));
+                SetFontSize(SF(26), SF(26));
                 SetFontColor(0xff82b1ff, 0);
                 DrawString(SX(60), SY(200), "Pairing / Connecting... Please check host.");
-                SetFontSize(SF(20), SF(20));
+                SetFontSize(SF(22), SF(22));
                 SetFontColor(0xffe0e0e0, 0);
-                DrawString(SX(60), SY(260), "PRESS (O) TO CANCEL");
+                DrawString(SX(60), SY(260), "PRESS \x02 TO CANCEL");
             } else if (ui_state == UI_STATE_ERROR) {
-                SetFontSize(SF(24), SF(24));
+                SetFontSize(SF(26), SF(26));
                 SetFontColor(0xffff5252, 0);
                 DrawString(SX(60), SY(200), "ERROR: Target unreachable or Pairing failed.");
-                DrawString(SX(60), SY(260), "Press [X] to return.");
+                DrawString(SX(60), SY(260), "Press \x01 to return.");
                 if (pad.buttons_pressed & A_FLAG) ui_state = UI_STATE_IP_ENTRY;
             }
         }
@@ -716,10 +959,10 @@ static void ui_loop(void *arg) {
             tiny3d_VertexFcolor(0.247f, 0.318f, 0.710f, 0.8f);
             tiny3d_End();
 
-            SetFontSize(SF(15), SF(15));
+            SetFontSize(SF(16), SF(16));
             SetFontColor(0xff80d8ff, 0); // Light Material Cyan/Blue for log readability
             for (int i = 0; i < visible_log_count; i++) {
-                DrawString(SX(20), (ui_height * 0.73f) + (i * SY(18)), visible_logs[i]);
+                DrawString(SX(20), (ui_height * 0.73f) + (i * SY(19)), visible_logs[i]);
             }
         }
 
@@ -743,6 +986,14 @@ void ui_shutdown() {
         u64 retval;
         sysThreadJoin(ui_thread, &retval);
         ui_thread_started = 0;
+    }
+    if (ft_face) {
+        FT_Done_Face(ft_face);
+        ft_face = NULL;
+    }
+    if (ft_library) {
+        FT_Done_FreeType(ft_library);
+        ft_library = NULL;
     }
     if (log_mutex_initialized) {
         sysMutexDestroy(log_mutex);

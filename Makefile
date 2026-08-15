@@ -37,12 +37,12 @@ OUT_PKG			:= $(BUILD)/$(TARGET)-$(TIMESTAMP).pkg
 OUT_GNPDRM_PKG	:= $(BUILD)/$(TARGET)-$(TIMESTAMP).gnpdrm.pkg
 OFILES			:= src/main.o src/ui.o src/video.o src/ps3_compat.o src/random.o src/net_logger.o src/openssl_compat.o src/connection.o src/input.o src/audio.o src/handshake.o
 # Enable Cell Broadband Engine CPU optimizations for the PowerPC Processing Unit (PPU)
-CFLAGS			+= -mcpu=cell -O2 -Wall -Wextra -Werror=implicit-function-declaration -MMD -MP -I$(PS3DEV)/ppu/include -I$(PS3DEV)/portlibs/ppu/include -I./src -I./third_party/moonlight-common-c/src -I./third_party/opus/include -include src/openssl_compat.h -fno-lto
+CFLAGS			+= -mcpu=cell -O2 -Wall -Wextra -Werror=implicit-function-declaration -MMD -MP -I$(PS3DEV)/ppu/include -I$(PS3DEV)/portlibs/ppu/include -I$(PS3DEV)/portlibs/ppu/include/freetype2 -I./src -I./third_party/moonlight-common-c/src -I./third_party/opus/include -include src/openssl_compat.h -fno-lto
 LDFLAGS     	+= -fno-lto -Wl,--no-undefined -Wl,--as-needed
 # Link with polarssl for client-side cryptography. The moonlight-common-c
 # submodule expects mbedtls, but we emulate it via src/openssl_compat.c
 # mapping to PolarSSL to avoid conflicts with the portlib mbedtls library.
-LIBS			:= -L$(PS3DEV)/ppu/lib -L$(PS3DEV)/portlibs/ppu/lib -L./third_party/moonlight-common-c -lmoonlight-common-c -L./third_party/opus -lopus -lfont3d -ltiny3d -lvdec -lsysmodule -lsysutil -lio -lrsx -lgcm_sys -lnet -lnetctl -laudio -lcurl -lpolarssl -lrt -lm -lz
+LIBS			:= -L$(PS3DEV)/ppu/lib -L$(PS3DEV)/portlibs/ppu/lib -L./third_party/moonlight-common-c -lmoonlight-common-c -L./third_party/opus -lopus -lfreetype -lfont3d -ltiny3d -lvdec -lsysmodule -lsysutil -lio -lrsx -lgcm_sys -lnet -lnetctl -laudio -lcurl -lpolarssl -lrt -lm -lz
 
 BUILDDIR		:= $(CURDIR)/$(BUILD)
 

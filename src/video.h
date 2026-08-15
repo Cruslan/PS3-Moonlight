@@ -2,6 +2,7 @@
 #define VIDEO_H
 
 #include <Limelight.h>
+#include <stdint.h>
 
 extern DECODER_RENDERER_CALLBACKS decoder_callbacks_ps3;
 
@@ -14,6 +15,7 @@ int  ps3video_get_decoded_fps();
 int  ps3video_get_decode_latency();
 int  ps3video_get_render_latency();
 int  ps3video_get_net_latency();
+uint32_t ps3video_get_total_decoded_frames();
 void vdec_poll(void);  // Call from main thread to consume decoded frames
 
 #endif

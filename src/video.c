@@ -28,6 +28,7 @@ static int current_video_fps = 0;
 
 static int decoded_frames_this_second = 0;
 static int current_decoded_fps = 0;
+static u32 total_decoded_frames = 0;
 
 #define SUBMIT_QUEUE_SIZE 16
 static u64 submit_queue[SUBMIT_QUEUE_SIZE];
@@ -276,6 +277,7 @@ void vdec_poll(void) {
     write_buf = next_write;
     
     if (ui_get_show_stats()) {
+        total_decoded_frames++;
         decoded_frames_this_second++;
     }
     if (mutex_initialized) sysMutexUnlock(frame_mutex);
@@ -633,6 +635,7 @@ int ps3video_get_decoded_fps() { return current_decoded_fps; }
 int ps3video_get_decode_latency() { return current_decode_latency_ms; }
 int ps3video_get_render_latency() { return current_render_latency_ms; }
 int ps3video_get_net_latency() { return current_net_latency_ms; }
+u32 ps3video_get_total_decoded_frames() { return total_decoded_frames; }
 
 void ps3video_draw() {
   if (!ps3video_is_active() || !vdec_frame_bufs[0])
