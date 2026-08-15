@@ -10,6 +10,9 @@
 #include <sys/thread.h>
 #include <sys/mutex.h>
 #include <sys/memory.h>
+#include <sys/stat.h>
+#include <errno.h>
+#include <ctype.h>
 #include <sysutil/sysutil.h>
 #include <sysutil/osk.h>
 #include <unistd.h>
@@ -18,6 +21,9 @@
 #include <Limelight.h>
 #include "video.h"
 #include "audio.h"
+
+#define CONFIG_DIR  "/dev_hdd0/game/MNLT00001/USRDIR"
+#define CONFIG_PATH "/dev_hdd0/game/MNLT00001/USRDIR/config.ini"
 
 static sys_ppu_thread_t ui_thread;
 static int ui_thread_started = 0;
@@ -34,8 +40,8 @@ static volatile int ui_state = UI_STATE_IP_ENTRY;
 #define SF(s) ((u32)(((float)(s) * scale_font < 8.0f) ? 8.0f : ((float)(s) * scale_font)))
 
 // Host IP state
-static int ip_octets[4] = {192, 168, 1, 100};
-static char target_ip_str[64] = "192.168.1.100";
+static int ip_octets[4] = {192, 168, 1, 1};
+static char target_ip_str[64] = "192.168.1.1";
 
 // Video and stream preferences
 static int ui_fps = 60;
@@ -77,6 +83,21 @@ int ui_get_vsync() { return ui_vsync; }
 int ui_get_show_stats() { return show_stats; }
 int ui_get_verbose() { return ui_verbose; }
 
+static char pairing_pin_str[16] = "";
+
+void ui_set_pairing_pin(const char *pin) {
+    if (pin) {
+        strncpy(pairing_pin_str, pin, sizeof(pairing_pin_str) - 1);
+        pairing_pin_str[sizeof(pairing_pin_str) - 1] = '\0';
+    } else {
+        pairing_pin_str[0] = '\0';
+    }
+}
+
+const char* ui_get_pairing_pin(void) {
+    return pairing_pin_str;
+}
+
 void ui_set_target_ip(const char *str) {
     if (!str || !*str) return;
     int o[4];
@@ -100,6 +121,71 @@ const char* ui_get_target_ip() {
                  ip_octets[0], ip_octets[1], ip_octets[2], ip_octets[3]);
     }
     return target_ip_str;
+}
+
+void ui_save_settings(void) {
+    mkdir("/dev_hdd0/game/MNLT00001", 0700);
+    mkdir(CONFIG_DIR, 0700);
+    
+    FILE *f = fopen(CONFIG_PATH, "w");
+    if (!f) {
+        f = fopen("config.ini", "w");
+    }
+    if (f) {
+        fprintf(f, "# PS3-Moonlight Configuration File\n");
+        fprintf(f, "host_ip=%s\n", target_ip_str);
+        fprintf(f, "fps=%d\n", ui_fps);
+        fprintf(f, "bitrate_idx=%d\n", ui_bitrate_idx);
+        fprintf(f, "vsync=%d\n", ui_vsync ? 1 : 0);
+        fprintf(f, "stats=%d\n", show_stats ? 1 : 0);
+        fprintf(f, "verbose=%d\n", ui_verbose ? 1 : 0);
+        fflush(f);
+        fclose(f);
+    }
+}
+
+void ui_load_settings(void) {
+    FILE *f = fopen(CONFIG_PATH, "r");
+    if (!f) {
+        f = fopen("config.ini", "r");
+    }
+    if (!f) return;
+    
+    char line[128];
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == ';' || *p == '\0' || *p == '\r' || *p == '\n') continue;
+        
+        char *end = p + strlen(p) - 1;
+        while (end >= p && (*end == '\r' || *end == '\n' || *end == ' ' || *end == '\t')) {
+            *end = '\0';
+            end--;
+        }
+        
+        char key[64] = {0};
+        char val[64] = {0};
+        if (sscanf(p, "%63[^=]=%63s", key, val) == 2) {
+            if (strcmp(key, "host_ip") == 0 || strcmp(key, "ip") == 0) {
+                if (val[0] != '\0') {
+                    ui_set_target_ip(val);
+                }
+            } else if (strcmp(key, "fps") == 0) {
+                int v = atoi(val);
+                if (v == 30 || v == 60) ui_fps = v;
+            } else if (strcmp(key, "bitrate_idx") == 0) {
+                int v = atoi(val);
+                if (v >= 0 && v < NUM_BITRATE_OPTIONS) ui_bitrate_idx = v;
+            } else if (strcmp(key, "vsync") == 0) {
+                ui_vsync = (atoi(val) != 0);
+            } else if (strcmp(key, "stats") == 0) {
+                show_stats = (atoi(val) != 0);
+            } else if (strcmp(key, "verbose") == 0) {
+                ui_verbose = (atoi(val) != 0);
+            }
+        }
+    }
+    fclose(f);
 }
 
 static void ascii_to_utf16(u16 *dst, const char *src, int max_len) {
@@ -136,8 +222,9 @@ static void ui_osk_callback(u64 status, u64 param, void *usrdata) {
             char entered_text[64];
             utf16_to_ascii(entered_text, osk_output, sizeof(entered_text));
             ui_set_target_ip(entered_text);
+            ui_save_settings();
             char log_msg[96];
-            snprintf(log_msg, sizeof(log_msg), "Host set to: %s", target_ip_str);
+            snprintf(log_msg, sizeof(log_msg), "Host saved: %s", target_ip_str);
             ui_push_log(log_msg);
         } else {
             ui_push_log("OSK: Finished");
@@ -322,6 +409,12 @@ void ui_init(int width, int height) {
     if (sysMutexCreate(&log_mutex, &attr) == 0) {
         log_mutex_initialized = 1;
     }
+
+    // Load persisted Host IP and stream settings from HDD
+    ui_load_settings();
+    char cfg_log[96];
+    snprintf(cfg_log, sizeof(cfg_log), "Config: Target Host [%s]", target_ip_str);
+    ui_push_log(cfg_log);
 
     // Register sysutil callback on slot 1 for OSK keyboard lifecycle
     sysUtilRegisterCallback(SYSUTIL_EVENT_SLOT1, ui_osk_callback, NULL);
@@ -658,11 +751,6 @@ static void ui_loop(void *arg) {
                     }
                 }
                 
-                // Dedicated shortcut: Square or Triangle opens OSK from any menu position
-                if ((pad.buttons_pressed & Y_FLAG) || (pad.buttons_pressed & X_FLAG)) {
-                    ui_open_osk();
-                }
-                
                 // START button initiates connection immediately from anywhere in main menu
                 if (pad.buttons_pressed & PLAY_FLAG) {
                     ui_state = UI_STATE_PAIRING;
@@ -681,40 +769,48 @@ static void ui_loop(void *arg) {
                 // Target FPS toggle (30 <-> 60)
                 if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & LEFT_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
                     ui_fps = (ui_fps == 30) ? 60 : 30;
+                    ui_save_settings();
                 }
             } else if (active_settings_item == 1) {
                 // Target Bitrate selection
                 if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
                     ui_bitrate_idx = (ui_bitrate_idx + 1) % NUM_BITRATE_OPTIONS;
+                    ui_save_settings();
                 }
                 if (pad.buttons_pressed & LEFT_FLAG) {
                     ui_bitrate_idx = (ui_bitrate_idx + NUM_BITRATE_OPTIONS - 1) % NUM_BITRATE_OPTIONS;
+                    ui_save_settings();
                 }
             } else if (active_settings_item == 2) {
                 // VSync toggle
                 if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & LEFT_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
                     ui_vsync = !ui_vsync;
                     gcmSetFlipMode(ui_vsync ? GCM_FLIP_VSYNC : GCM_FLIP_HSYNC);
+                    ui_save_settings();
                 }
             } else if (active_settings_item == 3) {
                 // Stats overlay toggle
                 if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & LEFT_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
                     show_stats = !show_stats;
+                    ui_save_settings();
                 }
             } else if (active_settings_item == 4) {
                 // Verbose logging toggle
                 if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & LEFT_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
                     ui_verbose = !ui_verbose;
+                    ui_save_settings();
                 }
             } else if (active_settings_item == 5) {
                 // Back to Main Menu
                 if (pad.buttons_pressed & A_FLAG) {
+                    ui_save_settings();
                     ui_state = UI_STATE_IP_ENTRY;
                 }
             }
             
             // Circle button returns to main menu from anywhere in settings
             if (pad.buttons_pressed & B_FLAG) {
+                ui_save_settings();
                 ui_state = UI_STATE_IP_ENTRY;
             }
         } else if (ui_state == UI_STATE_PAIRING) {
@@ -908,12 +1004,69 @@ static void ui_loop(void *arg) {
                 SetFontColor(0xff9e9e9e, 0);
                 DrawString(SX(60), SY(445), "\x05 Navigate   |   \x01 Select / Change   |   \x02 Back");
             } else if (ui_state == UI_STATE_PAIRING) {
+                // Title inside #3F51B5 header bar
                 SetFontSize(SF(26), SF(26));
-                SetFontColor(0xff82b1ff, 0);
-                DrawString(SX(60), SY(200), "Pairing / Connecting... Please check host.");
-                SetFontSize(SF(22), SF(22));
-                SetFontColor(0xffe0e0e0, 0);
-                DrawString(SX(60), SY(260), "PRESS \x02 TO CANCEL");
+                SetFontColor(0xffffffff, 0);
+                DrawString(SX(40), SY(18), "Moonlight PS3  -  Device Pairing");
+
+                if (pairing_pin_str[0] != '\0') {
+                    // Heading
+                    SetFontSize(SF(24), SF(24));
+                    SetFontColor(0xffffffff, 0);
+                    DrawString(SX(60), SY(110), "Sunshine Pairing Required");
+
+                    // Subheading instructions
+                    SetFontSize(SF(18), SF(18));
+                    SetFontColor(0xffb0bec5, 0);
+                    DrawString(SX(60), SY(150), "Open Sunshine Web UI (PIN Tab) and enter this PIN:");
+
+                    // PIN Badge Card Container (#1E1E1E background with #3F51B5 top accent line)
+                    tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
+                    tiny3d_VertexPos(SX(60), SY(190), 65535);
+                    tiny3d_VertexFcolor(0.12f, 0.12f, 0.12f, 0.95f);
+                    tiny3d_VertexPos(SX(400), SY(190), 65535);
+                    tiny3d_VertexFcolor(0.12f, 0.12f, 0.12f, 0.95f);
+                    tiny3d_VertexPos(SX(60), SY(275), 65535);
+                    tiny3d_VertexFcolor(0.12f, 0.12f, 0.12f, 0.95f);
+                    tiny3d_VertexPos(SX(400), SY(275), 65535);
+                    tiny3d_VertexFcolor(0.12f, 0.12f, 0.12f, 0.95f);
+                    tiny3d_End();
+
+                    // Top Accent Line (#3F51B5)
+                    tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
+                    tiny3d_VertexPos(SX(60), SY(190), 65535);
+                    tiny3d_VertexFcolor(0.247f, 0.318f, 0.710f, 1.0f);
+                    tiny3d_VertexPos(SX(400), SY(190), 65535);
+                    tiny3d_VertexFcolor(0.247f, 0.318f, 0.710f, 1.0f);
+                    tiny3d_VertexPos(SX(60), SY(193), 65535);
+                    tiny3d_VertexFcolor(0.247f, 0.318f, 0.710f, 1.0f);
+                    tiny3d_VertexPos(SX(400), SY(193), 65535);
+                    tiny3d_VertexFcolor(0.247f, 0.318f, 0.710f, 1.0f);
+                    tiny3d_End();
+
+                    // PIN Text in large bold highlight
+                    SetFontSize(SF(34), SF(34));
+                    SetFontColor(0xff82b1ff, 0); // Rose / Pink highlight
+                    DrawFormatString(SX(85), SY(218), "PIN:  %s", pairing_pin_str);
+
+                    // Waiting status
+                    SetFontSize(SF(18), SF(18));
+                    SetFontColor(0xff9e9e9e, 0);
+                    DrawString(SX(60), SY(305), "Waiting for confirmation from host...");
+                } else {
+                    SetFontSize(SF(24), SF(24));
+                    SetFontColor(0xff82b1ff, 0);
+                    DrawString(SX(60), SY(180), "Connecting to Sunshine Host...");
+
+                    SetFontSize(SF(18), SF(18));
+                    SetFontColor(0xffb0bec5, 0);
+                    DrawString(SX(60), SY(220), "Initializing handshake session...");
+                }
+
+                // Bottom cancel button legend
+                SetFontSize(SF(18), SF(18));
+                SetFontColor(0xff9e9e9e, 0);
+                DrawString(SX(60), SY(445), "\x02 Cancel Pairing");
             } else if (ui_state == UI_STATE_ERROR) {
                 SetFontSize(SF(26), SF(26));
                 SetFontColor(0xffff5252, 0);
@@ -973,6 +1126,7 @@ static void ui_loop(void *arg) {
 }
 
 void ui_shutdown() {
+    ui_save_settings();
     ui_stop();
     if (osk_active) {
         oskAbort();

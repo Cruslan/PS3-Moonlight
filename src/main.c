@@ -80,6 +80,8 @@ int main(int argc, char **argv) {
       const char *pcIp = ui_get_target_ip();
       NLOG("Attempting to connect to: %s", pcIp);
 
+      ui_set_pairing_pin("");
+
       // Handshake
       NLOG("H: Initializing Handshake...");
       handshake_info_t hinfo = {0};
@@ -102,8 +104,13 @@ int main(int argc, char **argv) {
       if (ui_get_state() == UI_STATE_IP_ENTRY) continue;
       
       if (!paired) {
+          ui_set_pairing_pin(pin);
+          char pin_log[96];
+          snprintf(pin_log, sizeof(pin_log), "Pairing required! PIN: %s (Enter in Sunshine)", pin);
+          ui_push_log(pin_log);
           NLOG("H: Attempting Pairing (Check Sunshine for PIN %s)...", pin);
           if (hv_pair(&hinfo, pin) != 0) {
+            ui_set_pairing_pin("");
             if (ui_get_state() == UI_STATE_IP_ENTRY) continue;
             // If user cancelled, they are already at UI_STATE_IP_ENTRY.
             // Only set UI_STATE_ERROR if it wasn't a deliberate cancel.
@@ -113,9 +120,12 @@ int main(int argc, char **argv) {
             }
             continue;
           }
+          ui_push_log("H: Pairing succeeded!");
       } else {
           NLOG("H: Already paired with server. Skipping PIN entry.");
       }
+
+      ui_set_pairing_pin("");
 
       if (ui_get_state() == UI_STATE_IP_ENTRY) continue; // Safety check
 
