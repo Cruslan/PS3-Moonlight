@@ -6,6 +6,9 @@
 #include <stdio.h>
 #include <sys/thread.h>
 #include <sys/mutex.h>
+#include <sys/memory.h>
+#include <sysutil/sysutil.h>
+#include <sysutil/osk.h>
 #include <unistd.h>
 #include <lv2/systime.h>
 #include "input.h"
@@ -27,20 +30,37 @@ static volatile int ui_state = UI_STATE_IP_ENTRY;
 #define SY(y) ((float)(y) * scale_y)
 #define SF(s) ((u32)(((float)(s) * scale_font < 8.0f) ? 8.0f : ((float)(s) * scale_font)))
 
-// IP state
-static int ip_octets[4] = {10, 42, 0, 1};
+// Host IP state
+static int ip_octets[4] = {192, 168, 1, 100};
+static char target_ip_str[64] = "192.168.1.100";
+
+// Video and stream preferences
 static int ui_fps = 60;
-static int ui_bitrate_options[] = {5000, 10000};
-static int ui_bitrate_idx = 1; // Default 10 Mbps
+static int ui_bitrate_options[] = {2500, 5000, 10000};
+#define NUM_BITRATE_OPTIONS (int)(sizeof(ui_bitrate_options) / sizeof(ui_bitrate_options[0]))
+static int ui_bitrate_idx = 2; // Default: 10 Mbps (Maximum)
 static int ui_vsync = 1; // Default: VSync ON (1)
-static int active_octet = 0; // 0-3: IP, 4: FPS, 5: Bitrate, 6: VSync, 7: Stats, 8: Verbose
-static char target_ip_str[64];
+
+// Navigation item counts for Main Menu and Settings Submenu
+#define MAIN_MENU_ITEM_COUNT 3
+static int active_main_item = 0; // 0: Sunshine Host IP, 1: Configure Settings, 2: Connect/Pair
+
+#define SETTINGS_ITEM_COUNT 6
+static int active_settings_item = 0; // 0: FPS, 1: Bitrate, 2: VSync, 3: Stats, 4: Verbose, 5: Back
 
 static int frames_drawn_this_sec = 0;
 static int ui_fps_actual = 0;
 static u64 last_ui_time = 0;
 static int show_stats = 0; // Default: Stats OFF (0)
 static int ui_verbose = 0; // Default: Verbose Logging OFF (0)
+
+// OSK management state
+static sys_mem_container_t osk_container;
+static int osk_container_created = 0;
+static volatile int osk_active = 0;
+static u16 osk_title[64];
+static u16 osk_initial[64];
+static u16 osk_output[64];
 
 void ui_set_state(int state) { ui_state = state; }
 int ui_get_state() { return ui_state; }
@@ -54,10 +74,125 @@ int ui_get_vsync() { return ui_vsync; }
 int ui_get_show_stats() { return show_stats; }
 int ui_get_verbose() { return ui_verbose; }
 
+void ui_set_target_ip(const char *str) {
+    if (!str || !*str) return;
+    int o[4];
+    if (sscanf(str, "%d.%d.%d.%d", &o[0], &o[1], &o[2], &o[3]) == 4) {
+        for (int i = 0; i < 4; i++) {
+            if (o[i] >= 0 && o[i] <= 255) {
+                ip_octets[i] = o[i];
+            }
+        }
+        snprintf(target_ip_str, sizeof(target_ip_str), "%d.%d.%d.%d", 
+                 ip_octets[0], ip_octets[1], ip_octets[2], ip_octets[3]);
+    } else {
+        strncpy(target_ip_str, str, sizeof(target_ip_str) - 1);
+        target_ip_str[sizeof(target_ip_str) - 1] = '\0';
+    }
+}
+
 const char* ui_get_target_ip() {
-    snprintf(target_ip_str, sizeof(target_ip_str), "%d.%d.%d.%d", 
-             ip_octets[0], ip_octets[1], ip_octets[2], ip_octets[3]);
+    if (target_ip_str[0] == '\0') {
+        snprintf(target_ip_str, sizeof(target_ip_str), "%d.%d.%d.%d", 
+                 ip_octets[0], ip_octets[1], ip_octets[2], ip_octets[3]);
+    }
     return target_ip_str;
+}
+
+static void ascii_to_utf16(u16 *dst, const char *src, int max_len) {
+    int i = 0;
+    while (src && src[i] && i < max_len - 1) {
+        dst[i] = (u16)(unsigned char)src[i];
+        i++;
+    }
+    dst[i] = 0;
+}
+
+static void utf16_to_ascii(char *dst, const u16 *src, int max_len) {
+    int i = 0;
+    while (src && src[i] && i < max_len - 1) {
+        dst[i] = (char)(src[i] & 0xFF);
+        i++;
+    }
+    dst[i] = 0;
+}
+
+static void ui_osk_callback(u64 status, u64 param, void *usrdata) {
+    (void)param;
+    (void)usrdata;
+    if (status == SYSUTIL_OSK_LOADED) {
+        ui_push_log("OSK: Virtual keyboard opened");
+    } else if (status == SYSUTIL_OSK_DONE) {
+        oskCallbackReturnParam ret_param;
+        memset(&ret_param, 0, sizeof(ret_param));
+        ret_param.str = osk_output;
+        ret_param.len = 64;
+        oskUnloadAsync(&ret_param);
+        
+        if (ret_param.res == OSK_OK) {
+            char entered_text[64];
+            utf16_to_ascii(entered_text, osk_output, sizeof(entered_text));
+            ui_set_target_ip(entered_text);
+            char log_msg[96];
+            snprintf(log_msg, sizeof(log_msg), "Host set to: %s", target_ip_str);
+            ui_push_log(log_msg);
+        } else {
+            ui_push_log("OSK: Finished");
+        }
+    } else if (status == SYSUTIL_OSK_INPUT_CANCELED) {
+        oskCallbackReturnParam ret_param;
+        memset(&ret_param, 0, sizeof(ret_param));
+        oskUnloadAsync(&ret_param);
+        ui_push_log("OSK: Virtual keyboard canceled");
+    } else if (status == SYSUTIL_OSK_UNLOADED) {
+        if (osk_container_created) {
+            sysMemContainerDestroy(osk_container);
+            osk_container_created = 0;
+        }
+        osk_active = 0;
+        ui_push_log("OSK: Virtual keyboard closed");
+    }
+}
+
+void ui_open_osk(void) {
+    if (osk_active) return;
+    
+    // Allocate 4MB memory container required by GameOS OSK service
+    if (sysMemContainerCreate(&osk_container, 4 * 1024 * 1024) != 0) {
+        ui_push_log("OSK Error: Memory container allocation failed");
+        return;
+    }
+    osk_container_created = 1;
+    osk_active = 1;
+    
+    oskParam param;
+    memset(&param, 0, sizeof(oskParam));
+    param.allowedPanels = OSK_PANEL_TYPE_DEFAULT | OSK_PANEL_TYPE_ALPHABET | 
+                          OSK_PANEL_TYPE_NUMERAL | OSK_PANEL_TYPE_URL | OSK_PANEL_TYPE_LATIN;
+    param.firstViewPanel = OSK_PANEL_TYPE_URL;
+    param.controlPoint.x = 0.0f;
+    param.controlPoint.y = 0.0f;
+    param.prohibitFlags = 0;
+
+    ui_get_target_ip();
+    ascii_to_utf16(osk_title, "Enter Sunshine Host IP / Address", 64);
+    ascii_to_utf16(osk_initial, target_ip_str, 64);
+
+    oskInputFieldInfo input_info;
+    memset(&input_info, 0, sizeof(oskInputFieldInfo));
+    input_info.message = osk_title;
+    input_info.startText = osk_initial;
+    input_info.maxLength = 63;
+
+    oskSetKeyLayoutOption(OSK_10KEY_PANEL | OSK_FULLKEY_PANEL);
+    oskSetInitialInputDevice(OSK_DEVICE_PAD);
+
+    if (oskLoadAsync(osk_container, &param, &input_info) != 0) {
+        ui_push_log("OSK Error: oskLoadAsync failed");
+        sysMemContainerDestroy(osk_container);
+        osk_container_created = 0;
+        osk_active = 0;
+    }
 }
 
 static void ui_loop(void *arg);
@@ -185,7 +320,10 @@ void ui_init(int width, int height) {
         log_mutex_initialized = 1;
     }
 
-    if (sysThreadCreate(&ui_thread, ui_loop, 0, 500, 0x4000,
+    // Register sysutil callback on slot 1 for OSK keyboard lifecycle
+    sysUtilRegisterCallback(SYSUTIL_EVENT_SLOT1, ui_osk_callback, NULL);
+
+    if (sysThreadCreate(&ui_thread, ui_loop, 0, 500, 0x10000,
                         THREAD_JOINABLE, "UI Thread") == 0) {
         ui_thread_started = 1;
     } else {
@@ -212,24 +350,40 @@ void ui_push_log(const char *msg) {
 }
 
 static void draw_background_gradient() {
+    // 1. Base Dark Gray Background (#303030 to #242424)
     tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
-    
-    // Top-Left (Dark Blue)
     tiny3d_VertexPos(0, 0, 65535);
-    tiny3d_VertexFcolor(0.0f, 0.0f, 0.2f, 1.0f);
-    
-    // Top-Right (Dark Blue)
+    tiny3d_VertexFcolor(0.188f, 0.188f, 0.188f, 1.0f); // #303030
     tiny3d_VertexPos(ui_width, 0, 65535);
-    tiny3d_VertexFcolor(0.0f, 0.0f, 0.2f, 1.0f);
-    
-    // Bottom-Left (Black)
-    tiny3d_VertexPos(0, ui_height * 0.7f, 65535);
-    tiny3d_VertexFcolor(0.0f, 0.0f, 0.0f, 1.0f);
-    
-    // Bottom-Right (Black)
-    tiny3d_VertexPos(ui_width, ui_height * 0.7f, 65535);
-    tiny3d_VertexFcolor(0.0f, 0.0f, 0.0f, 1.0f);
-    
+    tiny3d_VertexFcolor(0.188f, 0.188f, 0.188f, 1.0f);
+    tiny3d_VertexPos(0, ui_height * 0.72f, 65535);
+    tiny3d_VertexFcolor(0.141f, 0.141f, 0.141f, 1.0f); // #242424
+    tiny3d_VertexPos(ui_width, ui_height * 0.72f, 65535);
+    tiny3d_VertexFcolor(0.141f, 0.141f, 0.141f, 1.0f);
+    tiny3d_End();
+
+    // 2. Titlebar Header Bar (#3F51B5 Material Indigo Blue)
+    tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
+    tiny3d_VertexPos(0, 0, 65535);
+    tiny3d_VertexFcolor(0.247f, 0.318f, 0.710f, 1.0f); // #3F51B5
+    tiny3d_VertexPos(ui_width, 0, 65535);
+    tiny3d_VertexFcolor(0.247f, 0.318f, 0.710f, 1.0f);
+    tiny3d_VertexPos(0, SY(64), 65535);
+    tiny3d_VertexFcolor(0.200f, 0.260f, 0.620f, 1.0f);
+    tiny3d_VertexPos(ui_width, SY(64), 65535);
+    tiny3d_VertexFcolor(0.200f, 0.260f, 0.620f, 1.0f);
+    tiny3d_End();
+
+    // 3. Titlebar Bottom Accent Line (#1A237E Deep Indigo)
+    tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
+    tiny3d_VertexPos(0, SY(64), 65535);
+    tiny3d_VertexFcolor(0.102f, 0.137f, 0.494f, 1.0f);
+    tiny3d_VertexPos(ui_width, SY(64), 65535);
+    tiny3d_VertexFcolor(0.102f, 0.137f, 0.494f, 1.0f);
+    tiny3d_VertexPos(0, SY(67), 65535);
+    tiny3d_VertexFcolor(0.102f, 0.137f, 0.494f, 1.0f);
+    tiny3d_VertexPos(ui_width, SY(67), 65535);
+    tiny3d_VertexFcolor(0.102f, 0.137f, 0.494f, 1.0f);
     tiny3d_End();
 }
 
@@ -247,51 +401,110 @@ static void ui_loop(void *arg) {
         SetFontColor(0xffffffff, 0x00000000);
     }
     
+    // Enable Alpha Test and Blending to eliminate solid black texture boxes around font glyphs
+    tiny3d_AlphaTest(1, 0, TINY3D_ALPHA_FUNC_GREATER);
+    tiny3d_BlendFunc(1, 
+        TINY3D_BLEND_FUNC_SRC_RGB_SRC_ALPHA | TINY3D_BLEND_FUNC_SRC_ALPHA_SRC_ALPHA,
+        TINY3D_BLEND_FUNC_DST_RGB_ONE_MINUS_SRC_ALPHA | TINY3D_BLEND_FUNC_DST_ALPHA_ONE_MINUS_SRC_ALPHA,
+        TINY3D_BLEND_RGB_FUNC_ADD | TINY3D_BLEND_ALPHA_FUNC_ADD);
+    
     while (ui_running) {
+        // Pump sysutil event callbacks to service OSK and GameOS events
+        sysUtilCheckCallback();
         ps3input_get_data(&pad);
         
-        tiny3d_Clear(0x000000ff, TINY3D_CLEAR_ALL);
+        tiny3d_Clear(0x303030ff, TINY3D_CLEAR_ALL);
         
-        // Handle Input for Menu
+        // Handle input for UI menu states when OSK dialog is not actively capturing input
         if (ui_state == UI_STATE_IP_ENTRY) {
-            if (pad.buttons_pressed & LEFT_FLAG) active_octet = (active_octet + 8) % 9;
-            if (pad.buttons_pressed & RIGHT_FLAG) active_octet = (active_octet + 1) % 9;
+            if (!osk_active) {
+                // Vertical navigation across main menu rows
+                if (pad.buttons_pressed & UP_FLAG) {
+                    active_main_item = (active_main_item + MAIN_MENU_ITEM_COUNT - 1) % MAIN_MENU_ITEM_COUNT;
+                }
+                if (pad.buttons_pressed & DOWN_FLAG) {
+                    active_main_item = (active_main_item + 1) % MAIN_MENU_ITEM_COUNT;
+                }
+                
+                // Action handling per main menu item
+                if (active_main_item == 0) {
+                    // Host IP row: Open native OSK keyboard on Cross, Left, or Right
+                    if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & LEFT_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
+                        ui_open_osk();
+                    }
+                } else if (active_main_item == 1) {
+                    // Settings Submenu: Enter stream configuration menu
+                    if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
+                        ui_state = UI_STATE_SETTINGS;
+                        active_settings_item = 0;
+                    }
+                } else if (active_main_item == 2) {
+                    // Connect / Pair action button
+                    if (pad.buttons_pressed & A_FLAG) {
+                        ui_state = UI_STATE_PAIRING;
+                    }
+                }
+                
+                // Dedicated shortcut: Square or Triangle opens OSK from any menu position
+                if ((pad.buttons_pressed & Y_FLAG) || (pad.buttons_pressed & X_FLAG)) {
+                    ui_open_osk();
+                }
+                
+                // START button initiates connection immediately from anywhere in main menu
+                if (pad.buttons_pressed & PLAY_FLAG) {
+                    ui_state = UI_STATE_PAIRING;
+                }
+            }
+        } else if (ui_state == UI_STATE_SETTINGS) {
+            // Vertical navigation across settings submenu rows
+            if (pad.buttons_pressed & UP_FLAG) {
+                active_settings_item = (active_settings_item + SETTINGS_ITEM_COUNT - 1) % SETTINGS_ITEM_COUNT;
+            }
+            if (pad.buttons_pressed & DOWN_FLAG) {
+                active_settings_item = (active_settings_item + 1) % SETTINGS_ITEM_COUNT;
+            }
             
-            if (active_octet < 4) {
-                if (pad.buttons_pressed & UP_FLAG) ip_octets[active_octet] = (ip_octets[active_octet] + 1) % 256;
-                if (pad.buttons_pressed & DOWN_FLAG) ip_octets[active_octet] = (ip_octets[active_octet] + 255) % 256;
-            } else if (active_octet == 4) {
-                // Toggle between 30 and 60
-                if ((pad.buttons_pressed & UP_FLAG) || (pad.buttons_pressed & DOWN_FLAG)) {
+            if (active_settings_item == 0) {
+                // Target FPS toggle (30 <-> 60)
+                if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & LEFT_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
                     ui_fps = (ui_fps == 30) ? 60 : 30;
                 }
-            } else if (active_octet == 5) {
-                // Bitrate options: {5000, 10000}
-                if (pad.buttons_pressed & UP_FLAG) ui_bitrate_idx = (ui_bitrate_idx + 1) % 2;
-                if (pad.buttons_pressed & DOWN_FLAG) ui_bitrate_idx = (ui_bitrate_idx + 1) % 2;
-            } else if (active_octet == 6) {
-                // Toggle VSync between 1 (ON) and 0 (OFF)
-                if ((pad.buttons_pressed & UP_FLAG) || (pad.buttons_pressed & DOWN_FLAG)) {
+            } else if (active_settings_item == 1) {
+                // Target Bitrate selection
+                if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
+                    ui_bitrate_idx = (ui_bitrate_idx + 1) % NUM_BITRATE_OPTIONS;
+                }
+                if (pad.buttons_pressed & LEFT_FLAG) {
+                    ui_bitrate_idx = (ui_bitrate_idx + NUM_BITRATE_OPTIONS - 1) % NUM_BITRATE_OPTIONS;
+                }
+            } else if (active_settings_item == 2) {
+                // VSync toggle
+                if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & LEFT_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
                     ui_vsync = !ui_vsync;
                 }
-            } else if (active_octet == 7) {
-                // Toggle Stats between 1 (ON) and 0 (OFF)
-                if ((pad.buttons_pressed & UP_FLAG) || (pad.buttons_pressed & DOWN_FLAG)) {
+            } else if (active_settings_item == 3) {
+                // Stats overlay toggle
+                if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & LEFT_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
                     show_stats = !show_stats;
                 }
-            } else if (active_octet == 8) {
-                // Toggle Verbose Logging between 1 (ON) and 0 (OFF)
-                if ((pad.buttons_pressed & UP_FLAG) || (pad.buttons_pressed & DOWN_FLAG)) {
+            } else if (active_settings_item == 4) {
+                // Verbose logging toggle
+                if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & LEFT_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
                     ui_verbose = !ui_verbose;
+                }
+            } else if (active_settings_item == 5) {
+                // Back to Main Menu
+                if (pad.buttons_pressed & A_FLAG) {
+                    ui_state = UI_STATE_IP_ENTRY;
                 }
             }
             
-            // X to start pairing/launch
-            if (pad.buttons_pressed & A_FLAG) {
-                ui_state = UI_STATE_PAIRING;
+            // Circle button returns to main menu from anywhere in settings
+            if (pad.buttons_pressed & B_FLAG) {
+                ui_state = UI_STATE_IP_ENTRY;
             }
         } else if (ui_state == UI_STATE_PAIRING) {
-            // Circle to cancel
+            // Circle button to cancel pairing attempt
             if (pad.buttons_pressed & B_FLAG) {
                 ui_state = UI_STATE_IP_ENTRY;
             }
@@ -311,6 +524,13 @@ static void ui_loop(void *arg) {
         // 1. Draw UI / Video (Top 70%)
         tiny3d_UserViewportSurface(1, (float)ui_width, (float)ui_height);
         tiny3d_Project2D();
+        
+        // Ensure transparent alpha blending is active for all 2D text and menu overlays
+        tiny3d_AlphaTest(1, 0, TINY3D_ALPHA_FUNC_GREATER);
+        tiny3d_BlendFunc(1, 
+            TINY3D_BLEND_FUNC_SRC_RGB_SRC_ALPHA | TINY3D_BLEND_FUNC_SRC_ALPHA_SRC_ALPHA,
+            TINY3D_BLEND_FUNC_DST_RGB_ONE_MINUS_SRC_ALPHA | TINY3D_BLEND_FUNC_DST_ALPHA_ONE_MINUS_SRC_ALPHA,
+            TINY3D_BLEND_RGB_FUNC_ADD | TINY3D_BLEND_ALPHA_FUNC_ADD);
         
         if (ui_state == UI_STATE_STREAMING) {
             ps3video_draw();
@@ -348,101 +568,119 @@ static void ui_loop(void *arg) {
         } else {
             draw_background_gradient();
             
-            SetFontSize(SF(32), SF(32));
-            SetFontColor(0xffffffff, 0);
-            DrawString(SX(100), SY(100), "Moonlight PS3 - Server Setup");
-            
             if (ui_state == UI_STATE_IP_ENTRY) {
+                // Title inside #3F51B5 header bar
                 SetFontSize(SF(24), SF(24));
-                DrawString(SX(100), SY(160), "Enter Sunshine IP address:");
+                SetFontColor(0xffffffff, 0);
+                DrawString(SX(40), SY(20), "Moonlight PS3");
                 
-                for (int i = 0; i < 4; i++) {
-                    float x = SX(120 + (i * 110)); 
-                    float y = SY(210);
-
-                    if (i == active_octet) {
-                        SetFontColor(0xff00ff00, 0);
-                    } else {
-                        SetFontColor(0xffffffff, 0);
-                    }
-                    
-                    DrawFormatString(x, y, "%d", ip_octets[i]);
-                    
-                    SetFontColor(0xffffffff, 0);
-                    if (i < 3) DrawString(x + SX(75), y, ".");
-                }
-                
-                SetFontSize(SF(20), SF(20));
-                SetFontColor(0xffaaaaaa, 0);
-                DrawString(SX(100), SY(280), "Target FPS:");
-                
-                if (active_octet == 4) {
-                    SetFontColor(0xff00ff00, 0);
-                } else {
-                    SetFontColor(0xffffffff, 0);
-                }
-                DrawFormatString(SX(450), SY(280), "[ %d FPS ]", ui_fps);
-
-                SetFontColor(0xffaaaaaa, 0);
-                DrawString(SX(100), SY(315), "Target Bitrate:");
-                
-                if (active_octet == 5) {
-                    SetFontColor(0xff00ff00, 0);
-                } else {
-                    SetFontColor(0xffffffff, 0);
-                }
-                DrawFormatString(SX(450), SY(315), "[ %d Mbps ]", ui_bitrate_options[ui_bitrate_idx] / 1000);
-
-                SetFontColor(0xffaaaaaa, 0);
-                DrawString(SX(100), SY(350), "VSync:");
-                
-                if (active_octet == 6) {
-                    SetFontColor(0xff00ff00, 0);
-                } else {
-                    SetFontColor(0xffffffff, 0);
-                }
-                DrawFormatString(SX(450), SY(350), "[ %s ]", ui_vsync ? "ON" : "OFF");
-
-                SetFontColor(0xffaaaaaa, 0);
-                DrawString(SX(100), SY(385), "Stats Overlay:");
-                
-                if (active_octet == 7) {
-                    SetFontColor(0xff00ff00, 0);
-                } else {
-                    SetFontColor(0xffffffff, 0);
-                }
-                DrawFormatString(SX(450), SY(385), "[ %s ]", show_stats ? "ON" : "OFF");
-
-                SetFontColor(0xffaaaaaa, 0);
-                DrawString(SX(100), SY(420), "Verbose Logging:");
-                
-                if (active_octet == 8) {
-                    SetFontColor(0xff00ff00, 0);
-                } else {
-                    SetFontColor(0xffffffff, 0);
-                }
-                DrawFormatString(SX(450), SY(420), "[ %s ]", ui_verbose ? "ON" : "OFF");
-
+                // Row 0: Sunshine Host
                 SetFontSize(SF(22), SF(22));
-                SetFontColor(0xffaaaaaa, 0);
-                DrawString(SX(100), SY(470), "PRESS [X] TO CONNECT / PAIR");
+                SetFontColor((active_main_item == 0) ? 0xff82b1ff : 0xffb0bec5, 0);
+                float next_x = DrawString(SX(60), SY(130), "Sunshine Host:");
+                
+                SetFontColor((active_main_item == 0) ? 0xff82b1ff : 0xffffffff, 0);
+                DrawFormatString(next_x + SX(20), SY(130), "[ %s ]", target_ip_str);
+
+                // Row 1: Settings Sub-menu Link
+                SetFontSize(SF(22), SF(22));
+                SetFontColor((active_main_item == 1) ? 0xff82b1ff : 0xffffffff, 0);
+                DrawString(SX(60), SY(190), "[ CONFIGURE STREAM SETTINGS ]");
+                
+                // Active settings summary preview
+                SetFontSize(SF(16), SF(16));
+                SetFontColor(0xff9e9e9e, 0);
+                int kbps = ui_bitrate_options[ui_bitrate_idx];
+                if (kbps % 1000 == 0) {
+                    DrawFormatString(SX(60), SY(225), "Current: %d FPS  |  %d Mbps  |  VSync: %s  |  Stats: %s", 
+                                     ui_fps, kbps / 1000, ui_vsync ? "ON" : "OFF", show_stats ? "ON" : "OFF");
+                } else {
+                    DrawFormatString(SX(60), SY(225), "Current: %d FPS  |  %.1f Mbps  |  VSync: %s  |  Stats: %s", 
+                                     ui_fps, (float)kbps / 1000.0f, ui_vsync ? "ON" : "OFF", show_stats ? "ON" : "OFF");
+                }
+
+                // Row 2: Connect / Pair Action Button
+                SetFontSize(SF(22), SF(22));
+                SetFontColor((active_main_item == 2) ? 0xff82b1ff : 0xffffffff, 0);
+                DrawString(SX(60), SY(285), "[ CONNECT / PAIR TO HOST ]");
+
+                // Clean controls legend
+                SetFontSize(SF(16), SF(16));
+                SetFontColor(0xff9e9e9e, 0);
+                DrawString(SX(60), SY(450), "[UP/DOWN]: Navigate   |   [X]: Select");
+            } else if (ui_state == UI_STATE_SETTINGS) {
+                // Title inside #3F51B5 header bar
+                SetFontSize(SF(24), SF(24));
+                SetFontColor(0xffffffff, 0);
+                DrawString(SX(40), SY(20), "Moonlight PS3  -  Stream Settings");
+
+                // Row 0: Target FPS
+                SetFontSize(SF(20), SF(20));
+                SetFontColor((active_settings_item == 0) ? 0xff82b1ff : 0xffb0bec5, 0);
+                DrawString(SX(60), SY(120), "Target FPS:");
+                
+                SetFontColor((active_settings_item == 0) ? 0xff82b1ff : 0xffffffff, 0);
+                DrawFormatString(SX(430), SY(120), "[ %d FPS ]", ui_fps);
+
+                // Row 1: Target Bitrate
+                SetFontColor((active_settings_item == 1) ? 0xff82b1ff : 0xffb0bec5, 0);
+                DrawString(SX(60), SY(160), "Target Bitrate:");
+                
+                SetFontColor((active_settings_item == 1) ? 0xff82b1ff : 0xffffffff, 0);
+                int kbps = ui_bitrate_options[ui_bitrate_idx];
+                if (kbps % 1000 == 0) {
+                    DrawFormatString(SX(430), SY(160), "[ %d Mbps ]", kbps / 1000);
+                } else {
+                    DrawFormatString(SX(430), SY(160), "[ %.1f Mbps ]", (float)kbps / 1000.0f);
+                }
+
+                // Row 2: VSync Mode
+                SetFontColor((active_settings_item == 2) ? 0xff82b1ff : 0xffb0bec5, 0);
+                DrawString(SX(60), SY(200), "VSync Mode:");
+                
+                SetFontColor((active_settings_item == 2) ? 0xff82b1ff : 0xffffffff, 0);
+                DrawFormatString(SX(430), SY(200), "[ %s ]", ui_vsync ? "ON (Smooth 60Hz)" : "OFF (Low Latency)");
+
+                // Row 3: Stats Overlay
+                SetFontColor((active_settings_item == 3) ? 0xff82b1ff : 0xffb0bec5, 0);
+                DrawString(SX(60), SY(240), "Stats Overlay:");
+                
+                SetFontColor((active_settings_item == 3) ? 0xff82b1ff : 0xffffffff, 0);
+                DrawFormatString(SX(430), SY(240), "[ %s ]", show_stats ? "ON" : "OFF");
+
+                // Row 4: Verbose Logging
+                SetFontColor((active_settings_item == 4) ? 0xff82b1ff : 0xffb0bec5, 0);
+                DrawString(SX(60), SY(280), "Verbose Logging:");
+                
+                SetFontColor((active_settings_item == 4) ? 0xff82b1ff : 0xffffffff, 0);
+                DrawFormatString(SX(430), SY(280), "[ %s ]", ui_verbose ? "ON" : "OFF");
+
+                // Row 5: Back to Main Menu Button
+                SetFontSize(SF(20), SF(20));
+                SetFontColor((active_settings_item == 5) ? 0xff82b1ff : 0xffffffff, 0);
+                DrawString(SX(60), SY(340), "[ BACK TO MAIN MENU ]");
+
+                // Clean controls legend
+                SetFontSize(SF(16), SF(16));
+                SetFontColor(0xff9e9e9e, 0);
+                DrawString(SX(60), SY(450), "[UP/DOWN]: Navigate   |   [X]: Select / Change   |   (O): Back");
             } else if (ui_state == UI_STATE_PAIRING) {
                 SetFontSize(SF(24), SF(24));
-                SetFontColor(0xffffff00, 0);
-                DrawString(SX(100), SY(240), "Pairing / Connecting... Please check host.");
+                SetFontColor(0xff82b1ff, 0);
+                DrawString(SX(60), SY(200), "Pairing / Connecting... Please check host.");
                 SetFontSize(SF(20), SF(20));
-                SetFontColor(0xffaaaaaa, 0);
-                DrawString(SX(100), SY(300), "PRESS (O) TO CANCEL");
+                SetFontColor(0xffe0e0e0, 0);
+                DrawString(SX(60), SY(260), "PRESS (O) TO CANCEL");
             } else if (ui_state == UI_STATE_ERROR) {
                 SetFontSize(SF(24), SF(24));
-                SetFontColor(0xffff0000, 0);
-                DrawString(SX(100), SY(240), "ERROR: Target unreachable or Pairing failed.");
-                DrawString(SX(100), SY(300), "Press [X] to return.");
+                SetFontColor(0xffff5252, 0);
+                DrawString(SX(60), SY(200), "ERROR: Target unreachable or Pairing failed.");
+                DrawString(SX(60), SY(260), "Press [X] to return.");
                 if (pad.buttons_pressed & A_FLAG) ui_state = UI_STATE_IP_ENTRY;
             }
         }
 
-        // 2. Draw TTY Logs (Bottom 30%) - Only in Menus
+        // 2. Draw TTY Logs (Bottom 28%) - Only in Menus
         if (ui_state != UI_STATE_STREAMING) {
             char visible_logs[8][MAX_LOG_WIDTH];
             int visible_log_count = 0;
@@ -454,21 +692,34 @@ static void ui_loop(void *arg) {
             }
             if (log_mutex_initialized) sysMutexUnlock(log_mutex);
 
+            // Log container background (#1E1E1E)
             tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
-            tiny3d_VertexPos(0, ui_height * 0.7f, 65535);
-            tiny3d_VertexFcolor(0.0f, 0.0f, 0.0f, 0.8f);
-            tiny3d_VertexPos(ui_width, ui_height * 0.7f, 65535);
-            tiny3d_VertexFcolor(0.0f, 0.0f, 0.0f, 0.8f);
+            tiny3d_VertexPos(0, ui_height * 0.72f, 65535);
+            tiny3d_VertexFcolor(0.118f, 0.118f, 0.118f, 0.95f);
+            tiny3d_VertexPos(ui_width, ui_height * 0.72f, 65535);
+            tiny3d_VertexFcolor(0.118f, 0.118f, 0.118f, 0.95f);
             tiny3d_VertexPos(0, ui_height, 65535);
-            tiny3d_VertexFcolor(0.05f, 0.05f, 0.05f, 0.8f);
+            tiny3d_VertexFcolor(0.090f, 0.090f, 0.090f, 0.95f);
             tiny3d_VertexPos(ui_width, ui_height, 65535);
-            tiny3d_VertexFcolor(0.05f, 0.05f, 0.05f, 0.8f);
+            tiny3d_VertexFcolor(0.090f, 0.090f, 0.090f, 0.95f);
             tiny3d_End();
 
-            SetFontSize(SF(16), SF(16));
-            SetFontColor(0xff00ff00, 0); // Neo-Matrix green for debug logs
+            // Log header accent line (#3F51B5)
+            tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
+            tiny3d_VertexPos(0, ui_height * 0.72f, 65535);
+            tiny3d_VertexFcolor(0.247f, 0.318f, 0.710f, 0.8f);
+            tiny3d_VertexPos(ui_width, ui_height * 0.72f, 65535);
+            tiny3d_VertexFcolor(0.247f, 0.318f, 0.710f, 0.8f);
+            tiny3d_VertexPos(0, (ui_height * 0.72f) + SY(2), 65535);
+            tiny3d_VertexFcolor(0.247f, 0.318f, 0.710f, 0.8f);
+            tiny3d_VertexPos(ui_width, (ui_height * 0.72f) + SY(2), 65535);
+            tiny3d_VertexFcolor(0.247f, 0.318f, 0.710f, 0.8f);
+            tiny3d_End();
+
+            SetFontSize(SF(15), SF(15));
+            SetFontColor(0xff80d8ff, 0); // Light Material Cyan/Blue for log readability
             for (int i = 0; i < visible_log_count; i++) {
-                DrawString(SX(20), (ui_height * 0.71f) + (i * SY(20)), visible_logs[i]);
+                DrawString(SX(20), (ui_height * 0.73f) + (i * SY(18)), visible_logs[i]);
             }
         }
 
@@ -480,6 +731,14 @@ static void ui_loop(void *arg) {
 
 void ui_shutdown() {
     ui_stop();
+    if (osk_active) {
+        oskAbort();
+    }
+    sysUtilUnregisterCallback(SYSUTIL_EVENT_SLOT1);
+    if (osk_container_created) {
+        sysMemContainerDestroy(osk_container);
+        osk_container_created = 0;
+    }
     if (ui_thread_started) {
         u64 retval;
         sysThreadJoin(ui_thread, &retval);
@@ -490,3 +749,4 @@ void ui_shutdown() {
         log_mutex_initialized = 0;
     }
 }
+

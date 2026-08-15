@@ -5,6 +5,7 @@
 
 enum {
     UI_STATE_IP_ENTRY,
+    UI_STATE_SETTINGS,
     UI_STATE_PAIRING,
     UI_STATE_STREAMING,
     UI_STATE_ERROR
@@ -22,6 +23,8 @@ int ui_get_width();
 int ui_get_height();
 void ui_stop();
 void ui_shutdown();
+void ui_open_osk(void);
+void ui_set_target_ip(const char *ip);
 int ui_get_vsync();
 int ui_get_show_stats();
 int ui_get_verbose();
