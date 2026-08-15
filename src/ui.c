@@ -98,6 +98,43 @@ const char* ui_get_pairing_pin(void) {
     return pairing_pin_str;
 }
 
+// App Selection State
+static ps3_app_list_t current_app_list;
+static int active_app_idx = 0;
+static volatile int app_selection_confirmed = 0;
+
+void ui_set_app_list(const ps3_app_list_t *list) {
+    if (list) {
+        memcpy(&current_app_list, list, sizeof(current_app_list));
+    } else {
+        memset(&current_app_list, 0, sizeof(current_app_list));
+    }
+    active_app_idx = 0;
+    app_selection_confirmed = 0;
+}
+
+int ui_get_selected_app_id(void) {
+    if (current_app_list.count > 0 && active_app_idx >= 0 && active_app_idx < current_app_list.count) {
+        return current_app_list.apps[active_app_idx].id;
+    }
+    return -1;
+}
+
+const char* ui_get_selected_app_name(void) {
+    if (current_app_list.count > 0 && active_app_idx >= 0 && active_app_idx < current_app_list.count) {
+        return current_app_list.apps[active_app_idx].name;
+    }
+    return "";
+}
+
+int ui_is_app_selected(void) {
+    return app_selection_confirmed;
+}
+
+void ui_reset_app_selection(void) {
+    app_selection_confirmed = 0;
+}
+
 void ui_set_target_ip(const char *str) {
     if (!str || !*str) return;
     int o[4];
@@ -755,6 +792,12 @@ static void ui_loop(void *arg) {
                 if (pad.buttons_pressed & PLAY_FLAG) {
                     ui_state = UI_STATE_PAIRING;
                 }
+
+                // Circle button exits Moonlight to XMB
+                if (pad.buttons_pressed & B_FLAG) {
+                    ui_push_log("Exiting to PS3 XMB...");
+                    ui_stop();
+                }
             }
         } else if (ui_state == UI_STATE_SETTINGS) {
             // Vertical navigation across settings submenu rows
@@ -816,6 +859,23 @@ static void ui_loop(void *arg) {
         } else if (ui_state == UI_STATE_PAIRING) {
             // Circle button to cancel pairing attempt
             if (pad.buttons_pressed & B_FLAG) {
+                ui_state = UI_STATE_IP_ENTRY;
+            }
+        } else if (ui_state == UI_STATE_APPLIST) {
+            if (current_app_list.count > 0) {
+                if (pad.buttons_pressed & UP_FLAG) {
+                    active_app_idx = (active_app_idx + current_app_list.count - 1) % current_app_list.count;
+                }
+                if (pad.buttons_pressed & DOWN_FLAG) {
+                    active_app_idx = (active_app_idx + 1) % current_app_list.count;
+                }
+                if (pad.buttons_pressed & A_FLAG) {
+                    app_selection_confirmed = 1;
+                }
+            }
+            // Circle button returns to main menu
+            if (pad.buttons_pressed & B_FLAG) {
+                app_selection_confirmed = 0;
                 ui_state = UI_STATE_IP_ENTRY;
             }
         }
@@ -946,7 +1006,7 @@ static void ui_loop(void *arg) {
                 // Clean controls legend
                 SetFontSize(SF(18), SF(18));
                 SetFontColor(0xff9e9e9e, 0);
-                DrawString(SX(60), SY(445), "\x05 Navigate   |   \x01 Select");
+                DrawString(SX(60), SY(445), "\x05 Navigate   |   \x01 Select   |   \x02 Exit to XMB");
             } else if (ui_state == UI_STATE_SETTINGS) {
                 // Title inside #3F51B5 header bar
                 SetFontSize(SF(26), SF(26));
@@ -1067,6 +1127,79 @@ static void ui_loop(void *arg) {
                 SetFontSize(SF(18), SF(18));
                 SetFontColor(0xff9e9e9e, 0);
                 DrawString(SX(60), SY(445), "\x02 Cancel Pairing");
+            } else if (ui_state == UI_STATE_APPLIST) {
+                // Title inside #3F51B5 header bar
+                SetFontSize(SF(26), SF(26));
+                SetFontColor(0xffffffff, 0);
+                DrawString(SX(40), SY(18), "Moonlight PS3  -  Host Applications");
+
+                // Subtitle
+                SetFontSize(SF(22), SF(22));
+                SetFontColor(0xffffffff, 0);
+                DrawString(SX(60), SY(95), "Select Game or Application to Stream:");
+
+                if (current_app_list.count > 0) {
+                    SetFontSize(SF(18), SF(18));
+                    SetFontColor(0xffb0bec5, 0);
+                    DrawFormatString(SX(480), SY(95), "[ %d / %d ]", active_app_idx + 1, current_app_list.count);
+
+                    // Render visible applications list
+                    #define MAX_VISIBLE_APPS 6
+                    int start_idx = 0;
+                    if (active_app_idx >= MAX_VISIBLE_APPS) {
+                        start_idx = active_app_idx - MAX_VISIBLE_APPS + 1;
+                    }
+                    int visible_count = current_app_list.count - start_idx;
+                    if (visible_count > MAX_VISIBLE_APPS) visible_count = MAX_VISIBLE_APPS;
+
+                    for (int i = 0; i < visible_count; i++) {
+                        int idx = start_idx + i;
+                        float row_y = SY(135) + (i * SY(48));
+
+                        if (idx == active_app_idx) {
+                            // Active selection card background (#242424 with pink accent border)
+                            tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
+                            tiny3d_VertexPos(SX(55), row_y, 65535);
+                            tiny3d_VertexFcolor(0.16f, 0.16f, 0.16f, 0.95f);
+                            tiny3d_VertexPos(SX(850), row_y, 65535);
+                            tiny3d_VertexFcolor(0.16f, 0.16f, 0.16f, 0.95f);
+                            tiny3d_VertexPos(SX(55), row_y + SY(40), 65535);
+                            tiny3d_VertexFcolor(0.16f, 0.16f, 0.16f, 0.95f);
+                            tiny3d_VertexPos(SX(850), row_y + SY(40), 65535);
+                            tiny3d_VertexFcolor(0.16f, 0.16f, 0.16f, 0.95f);
+                            tiny3d_End();
+
+                            // Left Accent Line (#FF82B1)
+                            tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
+                            tiny3d_VertexPos(SX(55), row_y, 65535);
+                            tiny3d_VertexFcolor(1.0f, 0.51f, 0.69f, 1.0f);
+                            tiny3d_VertexPos(SX(59), row_y, 65535);
+                            tiny3d_VertexFcolor(1.0f, 0.51f, 0.69f, 1.0f);
+                            tiny3d_VertexPos(SX(55), row_y + SY(40), 65535);
+                            tiny3d_VertexFcolor(1.0f, 0.51f, 0.69f, 1.0f);
+                            tiny3d_VertexPos(SX(59), row_y + SY(40), 65535);
+                            tiny3d_VertexFcolor(1.0f, 0.51f, 0.69f, 1.0f);
+                            tiny3d_End();
+
+                            SetFontSize(SF(22), SF(22));
+                            SetFontColor(0xff82b1ff, 0); // Pink highlight
+                            DrawFormatString(SX(70), row_y + SY(8), "[ > ]  %s", current_app_list.apps[idx].name);
+                        } else {
+                            SetFontSize(SF(20), SF(20));
+                            SetFontColor(0xffb0bec5, 0);
+                            DrawFormatString(SX(70), row_y + SY(8), "       %s", current_app_list.apps[idx].name);
+                        }
+                    }
+                } else {
+                    SetFontSize(SF(22), SF(22));
+                    SetFontColor(0xffff82b1, 0);
+                    DrawString(SX(60), SY(180), "No applications found on host.");
+                }
+
+                // Clean controls legend
+                SetFontSize(SF(18), SF(18));
+                SetFontColor(0xff9e9e9e, 0);
+                DrawString(SX(60), SY(445), "\x05 Navigate   |   \x01 Launch Game   |   \x02 Cancel");
             } else if (ui_state == UI_STATE_ERROR) {
                 SetFontSize(SF(26), SF(26));
                 SetFontColor(0xffff5252, 0);

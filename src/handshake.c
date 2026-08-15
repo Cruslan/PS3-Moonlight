@@ -1130,30 +1130,87 @@ int hv_get_server_info(handshake_info_t *info) {
     return 0;
 }
 
-// Fetch first app ID from Sunshine via HTTPS /applist
-int hv_get_first_appid(handshake_info_t *info) {
+// Fetch all available apps from Sunshine via HTTPS /applist
+int hv_get_app_list(handshake_info_t *info, ps3_app_list_t *list) {
+    if (!info || !list) return -1;
+    memset(list, 0, sizeof(*list));
+
     char path[512];
     struct string s = {0};
     char uuid_str[40];
     if (generate_uuid_string(uuid_str) != 0) return -1;
     snprintf(path, sizeof(path), "/applist?uniqueid=%s&uuid=%s", info->unique_id, uuid_str);
-    if (ps3_https_request(info, path, &s) != 0) {
-        NLOG("hv_get_first_appid: HTTPS request failed");
+    if (ps3_https_request(info, path, &s) != 0 || !s.ptr) {
+        NLOG("hv_get_app_list: HTTPS request failed");
+        reset_string(&s);
         return -1;
     }
-    NLOG("Applist response: %.600s", s.ptr ? s.ptr : "");
-    // Extract first <ID> tag
-    char *id_str = extract_xml(s.ptr, "ID");
-    int appid = -1;
-    if (id_str) {
-        appid = atoi(id_str);
-        free(id_str);
-        NLOG("First app ID: %d", appid);
-    } else {
-        NLOG("No app ID found in applist");
+    NLOG("Applist response: %.600s", s.ptr);
+
+    const char *curr = s.ptr;
+    while (curr && list->count < MAX_APP_ENTRIES) {
+        const char *app_start = strstr(curr, "<App>");
+        if (!app_start) app_start = strstr(curr, "<app>");
+        if (!app_start) break;
+
+        const char *app_end = strstr(app_start, "</App>");
+        if (!app_end) app_end = strstr(app_start, "</app>");
+        if (!app_end) break;
+
+        size_t block_len = app_end - app_start;
+        char *block = malloc(block_len + 1);
+        if (block) {
+            memcpy(block, app_start, block_len);
+            block[block_len] = '\0';
+
+            char *title = extract_xml(block, "AppTitle");
+            if (!title) title = extract_xml(block, "apptitle");
+
+            char *id_str = extract_xml(block, "ID");
+            if (!id_str) id_str = extract_xml(block, "id");
+
+            if (title && id_str) {
+                list->apps[list->count].id = atoi(id_str);
+                strncpy(list->apps[list->count].name, title, sizeof(list->apps[list->count].name) - 1);
+                list->apps[list->count].name[sizeof(list->apps[list->count].name) - 1] = '\0';
+                NLOG("Found App [%d]: %s (ID: %d)", list->count, list->apps[list->count].name, list->apps[list->count].id);
+                list->count++;
+            }
+            if (title) free(title);
+            if (id_str) free(id_str);
+            free(block);
+        }
+        curr = app_end + 6;
     }
-    free(s.ptr);
-    return appid;
+
+    // Fallback: if no <App> tags were matched but a single <ID> exists
+    if (list->count == 0) {
+        char *id_str = extract_xml(s.ptr, "ID");
+        if (id_str) {
+            list->apps[0].id = atoi(id_str);
+            char *title = extract_xml(s.ptr, "AppTitle");
+            if (title) {
+                strncpy(list->apps[0].name, title, sizeof(list->apps[0].name) - 1);
+                free(title);
+            } else {
+                strncpy(list->apps[0].name, "Default Host Game", sizeof(list->apps[0].name) - 1);
+            }
+            list->count = 1;
+            free(id_str);
+        }
+    }
+
+    reset_string(&s);
+    return (list->count > 0) ? 0 : -1;
+}
+
+// Fetch first app ID from Sunshine via HTTPS /applist
+int hv_get_first_appid(handshake_info_t *info) {
+    ps3_app_list_t list;
+    if (hv_get_app_list(info, &list) == 0 && list.count > 0) {
+        return list.apps[0].id;
+    }
+    return -1;
 }
 
 // Helper: build the common launch/resume query params

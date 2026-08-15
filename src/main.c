@@ -137,6 +137,36 @@ int main(int argc, char **argv) {
 
       if (ui_get_state() == UI_STATE_IP_ENTRY) continue;
 
+      NLOG("H: Fetching app list...");
+      ps3_app_list_t app_list = {0};
+      if (hv_get_app_list(&hinfo, &app_list) != 0 || app_list.count == 0) {
+        if (ui_get_state() == UI_STATE_IP_ENTRY) continue;
+        NLOG("H: Failed to fetch app list or no apps found.");
+        ui_set_state(UI_STATE_ERROR);
+        continue;
+      }
+
+      // Transition to App Selection state
+      ui_set_app_list(&app_list);
+      ui_reset_app_selection();
+      ui_set_state(UI_STATE_APPLIST);
+      NLOG("H: Waiting for user to select an app from UI (found %d apps)...", app_list.count);
+
+      // Wait for user confirmation or cancellation
+      while (ui_is_running() && ui_get_state() == UI_STATE_APPLIST && !ui_is_app_selected()) {
+        sysUtilCheckCallback();
+        usleep(20000);
+      }
+
+      if (!ui_is_running() || ui_get_state() != UI_STATE_APPLIST) {
+        NLOG("H: App selection cancelled or aborted.");
+        continue;
+      }
+
+      int app_id = ui_get_selected_app_id();
+      const char *app_name = ui_get_selected_app_name();
+      NLOG("H: User selected App '%s' (ID: %d)", app_name, app_id);
+
       unsigned char rikey_bin[16];
       char rikey_hex[33];
       if (ps3_random_bytes(rikey_bin, sizeof(rikey_bin)) != 0 ||
@@ -149,16 +179,7 @@ int main(int argc, char **argv) {
       rikey_hex[32] = '\0';
       int rikeyid = (int)(random_value % 1000000);
 
-      NLOG("H: Fetching app list...");
-      int app_id = hv_get_first_appid(&hinfo);
-      if (ui_get_state() == UI_STATE_IP_ENTRY) continue;
-      if (app_id <= 0) {
-        NLOG("H: No valid app ID found.");
-        ui_set_state(UI_STATE_ERROR);
-        continue;
-      }
-
-      NLOG("H: Launching App ID %d...", app_id);
+      NLOG("H: Launching App '%s' (ID %d)...", app_name, app_id);
       if (hv_launch(&hinfo, app_id, rikey_hex, rikeyid) != 0) {
         if (ui_get_state() == UI_STATE_IP_ENTRY) continue;
         NLOG("H: hv_launch failed.");
