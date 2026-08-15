@@ -26,6 +26,7 @@ int ui_get_height();
 void ui_stop();
 void ui_shutdown();
 void ui_open_osk(void);
+void ui_open_exit_dialog(void);
 void ui_set_target_ip(const char *ip);
 int ui_get_vsync();
 int ui_get_show_stats();

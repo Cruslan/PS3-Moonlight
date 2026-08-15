@@ -15,6 +15,7 @@
 #include <ctype.h>
 #include <sysutil/sysutil.h>
 #include <sysutil/osk.h>
+#include <sysutil/msg.h>
 #include <unistd.h>
 #include <lv2/systime.h>
 #include "input.h"
@@ -320,6 +321,29 @@ void ui_open_osk(void) {
         osk_container_created = 0;
         osk_active = 0;
     }
+}
+
+// Native PS3 Message Dialog (Confirmation Pop-up)
+static volatile int msg_dialog_active = 0;
+
+static void ui_msg_dialog_callback(msgButton button, void *usrData) {
+    (void)usrData;
+    msgDialogClose(0.0f);
+    msg_dialog_active = 0;
+    if (button == MSG_DIALOG_BTN_YES) {
+        ui_push_log("Exit confirmed by user. Quitting to PS3 XMB...");
+        ui_stop();
+    } else {
+        ui_push_log("Exit canceled.");
+    }
+}
+
+void ui_open_exit_dialog(void) {
+    if (msg_dialog_active || osk_active) return;
+    msg_dialog_active = 1;
+    msgDialogOpen2(MSG_DIALOG_NORMAL | MSG_DIALOG_BTN_TYPE_YESNO | MSG_DIALOG_DEFAULT_CURSOR_NO,
+                   "Do you want to quit Moonlight and return to the PS3 XMB?",
+                   ui_msg_dialog_callback, NULL, NULL);
 }
 
 static void ui_loop(void *arg);
@@ -760,7 +784,7 @@ static void ui_loop(void *arg) {
         
         // Handle input for UI menu states when OSK dialog is not actively capturing input
         if (ui_state == UI_STATE_IP_ENTRY) {
-            if (!osk_active) {
+            if (!osk_active && !msg_dialog_active) {
                 // Vertical navigation across main menu rows
                 if (pad.buttons_pressed & UP_FLAG) {
                     active_main_item = (active_main_item + MAIN_MENU_ITEM_COUNT - 1) % MAIN_MENU_ITEM_COUNT;
@@ -793,10 +817,9 @@ static void ui_loop(void *arg) {
                     ui_state = UI_STATE_PAIRING;
                 }
 
-                // Circle button exits Moonlight to XMB
+                // Circle button opens native PS3 confirmation dialog to exit to XMB
                 if (pad.buttons_pressed & B_FLAG) {
-                    ui_push_log("Exiting to PS3 XMB...");
-                    ui_stop();
+                    ui_open_exit_dialog();
                 }
             }
         } else if (ui_state == UI_STATE_SETTINGS) {
@@ -1261,6 +1284,10 @@ static void ui_loop(void *arg) {
 void ui_shutdown() {
     ui_save_settings();
     ui_stop();
+    if (msg_dialog_active) {
+        msgDialogAbort();
+        msg_dialog_active = 0;
+    }
     if (osk_active) {
         oskAbort();
     }
