@@ -50,7 +50,7 @@ CFILES			:= src/main.c src/ui.c src/video.c src/ps3_compat.c src/random.c src/ne
 OFILES			:= $(CFILES:.c=.o)
 DEBUG_OFILES		:= $(patsubst src/%.c, $(BUILD)/obj_debug/%.o, $(CFILES))
 
-CFLAGS			+= -mcpu=cell -O2 -Wall -Wextra -Werror=implicit-function-declaration -MMD -MP -I$(PS3DEV)/ppu/include -I$(PS3DEV)/portlibs/ppu/include -I$(PS3DEV)/portlibs/ppu/include/freetype2 -I./src -I./third_party/moonlight-common-c/src -I./third_party/opus/include -include src/openssl_compat.h -fno-lto
+CFLAGS			+= -mcpu=cell -mstrict-align -O2 -Wall -Wextra -Werror=implicit-function-declaration -MMD -MP -I$(PS3DEV)/ppu/include -I$(PS3DEV)/portlibs/ppu/include -I$(PS3DEV)/portlibs/ppu/include/freetype2 -I./src -I./third_party/moonlight-common-c/src -I./third_party/opus/include -include src/openssl_compat.h -fno-lto
 LDFLAGS     	+= -fno-lto -Wl,--no-undefined -Wl,--as-needed
 
 # Minimal & clean: Debug build instruments all functions and enables ps3perf
