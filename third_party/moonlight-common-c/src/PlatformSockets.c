@@ -103,9 +103,12 @@ int setNonFatalRecvTimeoutMs(SOCKET s, int timeoutMs) {
 }
 
 int pollSockets(struct pollfd* pollFds, int pollFdsCount, int timeoutMs) {
-#if defined(LC_WINDOWS) || defined(__PPU__)
-    // We emulate poll() with select() to avoid known kernel bugs in PS3 netPoll
-    // and Windows WSAPoll.
+#if defined(LC_WINDOWS)
+    // We could have used WSAPoll() but it has some nasty bugs
+    // https://daniel.haxx.se/blog/2012/10/10/wsapoll-is-broken/
+    //
+    // We'll emulate WSAPoll() with select(). Fortunately, Microsoft's definition
+    // of fd_set does not have the same stack corruption hazards that UNIX does.
     fd_set readFds, writeFds, exceptFds;
     int i, err, nfds;
     struct timeval tv;
@@ -119,13 +122,7 @@ int pollSockets(struct pollfd* pollFds, int pollFdsCount, int timeoutMs) {
         // Clear revents on input like poll() does
         pollFds[i].revents = 0;
 
-#if defined(__PPU__)
-        // On PSL1GHT, socket descriptors have bit 0x40000000 set.
-        // Strip the mask so FD_SET indices remain within fd_set bounds.
-        int s = (int)(pollFds[i].fd & ~0x40000000);
-#else
         int s = (int)pollFds[i].fd;
-#endif
 
         if (pollFds[i].events & POLLIN) {
             FD_SET(s, &readFds);
@@ -153,11 +150,7 @@ int pollSockets(struct pollfd* pollFds, int pollFdsCount, int timeoutMs) {
     }
 
     for (i = 0; i < pollFdsCount; i++) {
-#if defined(__PPU__)
-        int s = (int)(pollFds[i].fd & ~0x40000000);
-#else
         int s = (int)pollFds[i].fd;
-#endif
         if (FD_ISSET(s, &readFds)) {
             pollFds[i].revents |= (POLLIN | POLLRDNORM);
         }
