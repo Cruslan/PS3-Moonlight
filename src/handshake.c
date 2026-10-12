@@ -865,7 +865,8 @@ int hv_pair(handshake_info_t *info, const char *pin) {
     int  hash_length = 32; // Sunshine = SHA256
 
     int paired = 0;
-    for (int retry = 0; retry < 10 && !paired; retry++) {
+    // Retry for 2 minutes (60 retries * 2s = 120s) to give user enough time to enter PIN in Sunshine web UI
+    for (int retry = 0; retry < 60 && !paired; retry++) {
         reset_string(&s);
 
         // Regenerate uuid per request (like vita does)
@@ -891,7 +892,7 @@ int hv_pair(handshake_info_t *info, const char *pin) {
         char *pv = extract_xml(s.ptr, "paired");
         if (!pv || strcmp(pv, "1") != 0) {
             free(pv);
-            NLOG("Waiting for PIN entry (%d/30)...", retry+1);
+            NLOG("Waiting for PIN entry (%d/60)...", retry+1);
             sleep(2); continue;
         }
         free(pv);

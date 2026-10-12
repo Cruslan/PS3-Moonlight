@@ -136,7 +136,7 @@ static void VideoReceiveThreadProc(void* context) {
     // reduces time spent in the drain loop, giving the main thread more
     // opportunities to call vdec_poll() and avoid VDEC back-pressure.
     #ifdef __PPU__
-    #define VIDEO_BATCH_SIZE 16
+    #define VIDEO_BATCH_SIZE 64
     #define VIDEO_MAX_PACKET_SIZE 1500
     #else
     #define VIDEO_BATCH_SIZE 32

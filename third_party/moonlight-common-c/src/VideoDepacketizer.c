@@ -112,13 +112,19 @@ static void dropFrameState(void) {
     // We're dropping frame state now
     dropStatePending = false;
 
-    if (strictIdrFrameWait || !idrFrameProcessed || waitingForIdrFrame) {
-        // We'll need an IDR frame now if we're in non-RFI mode, if we've never
-        // received an IDR frame, or if we explicitly need an IDR frame.
+    if (!idrFrameProcessed) {
+        // We'll need an initial IDR frame to establish decoder state and start playback.
         waitingForIdrFrame = true;
     }
     else {
-        waitingForRefInvalFrame = true;
+        // Playback is already active: request an IDR frame to refresh reference frames,
+        // but DO NOT enter persistent frame-drop mode (waitingForIdrFrame = true).
+        // On static or low-motion scenes (e.g. desktop, menus, small mouse movement),
+        // KMS/NVENC skips frames and does not send frequent IDRs. Dropping incoming
+        // P-frames causes the stream to freeze completely until a major scene cut.
+        if (waitingForNextSuccessfulFrame) {
+            LiRequestIdrFrame();
+        }
     }
 
     // Count the number of consecutive frames dropped
@@ -132,7 +138,9 @@ static void dropFrameState(void) {
         consecutiveFrameDrops = 0;
 
         // Request an IDR frame
-        waitingForIdrFrame = true;
+        if (!idrFrameProcessed) {
+            waitingForIdrFrame = true;
+        }
         LiRequestIdrFrame();
     }
 
@@ -1105,6 +1113,9 @@ static void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length,
             dropFrameState();
             return;
         }
+
+        // Reset waitingForNextSuccessfulFrame on complete frame delivery
+        waitingForNextSuccessfulFrame = false;
 
         LC_ASSERT(!waitingForNextSuccessfulFrame);
 

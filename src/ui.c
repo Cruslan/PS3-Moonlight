@@ -55,8 +55,8 @@ static int ui_vsync = 1; // Default: VSync ON (1)
 #define MAIN_MENU_ITEM_COUNT 3
 static int active_main_item = 0; // 0: Sunshine Host IP, 1: Configure Settings, 2: Connect/Pair
 
-#define SETTINGS_ITEM_COUNT 7
-static int active_settings_item = 0; // 0: FPS, 1: Bitrate, 2: Mouse, 3: VSync, 4: Stats, 5: Verbose, 6: Back
+#define SETTINGS_ITEM_COUNT 8
+static int active_settings_item = 0; // 0: FPS, 1: Bitrate, 2: Mouse, 3: VSync, 4: Stats, 5: Verbose, 6: Upscaler, 7: Back
 
 static int frames_drawn_this_sec = 0;
 static int ui_fps_actual = 0;
@@ -64,6 +64,7 @@ static u64 last_ui_time = 0;
 static int show_stats = 0; // Default: Stats OFF (0)
 static int ui_verbose = 0; // Default: Verbose Logging OFF (0)
 static int ui_mouse_mode = 0; // Default: 0 = Game Mode (Relative), 1 = Desktop Mode (Absolute)
+static int ui_upscaler_mode = 0; // Default: 0 = Bilinear (Legacy), 1 = CAS 5-Tap (PoC)
 
 // OSK management state
 static sys_mem_container_t osk_container;
@@ -85,6 +86,8 @@ int ui_get_vsync() { return ui_vsync; }
 int ui_get_show_stats() { return show_stats; }
 int ui_get_verbose() { return ui_verbose; }
 int ui_get_mouse_mode(void) { return ui_mouse_mode; }
+int ui_get_upscaler_mode(void) { return ui_upscaler_mode; }
+void ui_set_upscaler_mode(int mode) { ui_upscaler_mode = mode ? 1 : 0; }
 
 static char pairing_pin_str[16] = "";
 
@@ -180,6 +183,7 @@ void ui_save_settings(void) {
         fprintf(f, "vsync=%d\n", ui_vsync ? 1 : 0);
         fprintf(f, "stats=%d\n", show_stats ? 1 : 0);
         fprintf(f, "verbose=%d\n", ui_verbose ? 1 : 0);
+        fprintf(f, "upscaler=%d\n", ui_upscaler_mode ? 1 : 0);
         fflush(f);
         fclose(f);
     }
@@ -226,6 +230,8 @@ void ui_load_settings(void) {
                 show_stats = (atoi(val) != 0);
             } else if (strcmp(key, "verbose") == 0) {
                 ui_verbose = (atoi(val) != 0);
+            } else if (strcmp(key, "upscaler") == 0 || strcmp(key, "scaling") == 0) {
+                ui_upscaler_mode = (atoi(val) != 0);
             }
         }
     }
@@ -879,6 +885,12 @@ static void ui_loop(void *arg) {
                     ui_save_settings();
                 }
             } else if (active_settings_item == 6) {
+                // Video Upscaler toggle (0: Bilinear Legacy <-> 1: CAS PoC)
+                if ((pad.buttons_pressed & A_FLAG) || (pad.buttons_pressed & LEFT_FLAG) || (pad.buttons_pressed & RIGHT_FLAG)) {
+                    ui_upscaler_mode = !ui_upscaler_mode;
+                    ui_save_settings();
+                }
+            } else if (active_settings_item == 7) {
                 // Back to Main Menu
                 if (pad.buttons_pressed & A_FLAG) {
                     ui_save_settings();
@@ -946,7 +958,7 @@ static void ui_loop(void *arg) {
                 float sy = SY(30);
                 float line_h = SY(20);
                 float hud_w = SX(360);
-                float hud_h = 11.5f * line_h;
+                float hud_h = 12.5f * line_h;
 
                 // Semi-transparent dark HUD container background (#121212 with 85% alpha)
                 tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
@@ -984,8 +996,9 @@ static void ui_loop(void *arg) {
                 DrawFormatString(sx, sy + 5 * line_h, "Network Latency: %d ms", ps3video_get_net_latency() / 2);
                 DrawFormatString(sx, sy + 6 * line_h, "Total Latency: %d ms", (ps3video_get_net_latency() / 2) + ps3video_get_decode_latency() + ps3video_get_render_latency());
                 DrawFormatString(sx, sy + 7 * line_h, "Resolution: %dx%d", ui_width, ui_height);
-                DrawFormatString(sx, sy + 8 * line_h, "Target FPS: %d FPS", ui_get_fps());
-                DrawFormatString(sx, sy + 9 * line_h, "Bitrate: %d Mbps", ui_get_bitrate() / 1000);
+                DrawFormatString(sx, sy + 8 * line_h, "Scaling: %s", (ui_upscaler_mode == 1) ? "CAS 5-Tap (PoC)" : "Bilinear (Legacy)");
+                DrawFormatString(sx, sy + 9 * line_h, "Target FPS: %d FPS", ui_get_fps());
+                DrawFormatString(sx, sy + 10 * line_h, "Bitrate: %d Mbps", ui_get_bitrate() / 1000);
                 
                 /* Real-time Hardware Telemetry Stream Link Activity Monitor */
                 u32 total_frames = ps3video_get_total_decoded_frames();
@@ -997,7 +1010,7 @@ static void ui_loop(void *arg) {
                     case 2: spinner = "[ | ]"; break;
                     case 3: spinner = "[ / ]"; break;
                 }
-                DrawFormatString(sx, sy + 10 * line_h, "Stream Link: ACTIVE %s", spinner);
+                DrawFormatString(sx, sy + 11 * line_h, "Stream Link: ACTIVE %s", spinner);
             }
         } else {
             draw_background_gradient();
@@ -1026,11 +1039,11 @@ static void ui_loop(void *arg) {
                 SetFontColor(0xff9e9e9e, 0);
                 int kbps = ui_bitrate_options[ui_bitrate_idx];
                 if (kbps % 1000 == 0) {
-                    DrawFormatString(SX(60), SY(225), "Current: %d FPS  |  %d Mbps  |  Mouse: %s  |  VSync: %s", 
-                                     ui_fps, kbps / 1000, (ui_mouse_mode == 0) ? "GAME" : "DESKTOP", ui_vsync ? "ON" : "OFF");
+                    DrawFormatString(SX(60), SY(225), "Current: %d FPS  |  %d Mbps  |  Scaling: %s  |  VSync: %s", 
+                                     ui_fps, kbps / 1000, (ui_upscaler_mode == 1) ? "CAS (PoC)" : "Bilinear", ui_vsync ? "ON" : "OFF");
                 } else {
-                    DrawFormatString(SX(60), SY(225), "Current: %d FPS  |  %.1f Mbps  |  Mouse: %s  |  VSync: %s", 
-                                     ui_fps, (float)kbps / 1000.0f, (ui_mouse_mode == 0) ? "GAME" : "DESKTOP", ui_vsync ? "ON" : "OFF");
+                    DrawFormatString(SX(60), SY(225), "Current: %d FPS  |  %.1f Mbps  |  Scaling: %s  |  VSync: %s", 
+                                     ui_fps, (float)kbps / 1000.0f, (ui_upscaler_mode == 1) ? "CAS (PoC)" : "Bilinear", ui_vsync ? "ON" : "OFF");
                 }
 
                 // Row 2: Connect / Pair Action Button
@@ -1096,10 +1109,17 @@ static void ui_loop(void *arg) {
                 SetFontColor((active_settings_item == 5) ? 0xff82b1ff : 0xffffffff, 0);
                 DrawFormatString(SX(430), SY(280), "[ %s ]", ui_verbose ? "ON" : "OFF");
 
-                // Row 6: Back to Main Menu Button
-                SetFontSize(SF(22), SF(22));
+                // Row 6: Upscaling Method (Legacy Bilinear vs CAS PoC)
+                SetFontColor((active_settings_item == 6) ? 0xff82b1ff : 0xffb0bec5, 0);
+                DrawString(SX(60), SY(315), "Upscaling Method:");
+                
                 SetFontColor((active_settings_item == 6) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawString(SX(60), SY(330), "[ BACK TO MAIN MENU ]");
+                DrawFormatString(SX(430), SY(315), "[ %s ]", (ui_upscaler_mode == 1) ? "CAS 5-Tap (PoC)" : "Bilinear (Legacy)");
+
+                // Row 7: Back to Main Menu Button
+                SetFontSize(SF(22), SF(22));
+                SetFontColor((active_settings_item == 7) ? 0xff82b1ff : 0xffffffff, 0);
+                DrawString(SX(60), SY(360), "[ BACK TO MAIN MENU ]");
 
                 // Clean controls legend
                 SetFontSize(SF(18), SF(18));

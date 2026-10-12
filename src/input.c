@@ -244,6 +244,17 @@ static void input_loop(void *arg) {
                     if (paddata.BTN_L3) buttonFlags |= LS_CLK_FLAG;
                     if (paddata.BTN_R3) buttonFlags |= RS_CLK_FLAG;
 
+                    // Real-time Upscaler Toggle Shortcut: L3 + R3 pressed together during stream
+                    static int last_l3_r3 = 0;
+                    int l3_r3_pressed = (paddata.BTN_L3 && paddata.BTN_R3);
+                    if (l3_r3_pressed && !last_l3_r3) {
+                        int new_mode = !ui_get_upscaler_mode();
+                        ui_set_upscaler_mode(new_mode);
+                        printf("[INPUT] In-stream shortcut: Toggled upscaler to %s\n",
+                               new_mode ? "CAS 5-Tap (PoC)" : "Bilinear (Legacy)");
+                    }
+                    last_l3_r3 = l3_r3_pressed;
+
                     // Center is ~128. The PS3 controller Y-axis ranges from 0 (UP) to 255 (DOWN).
                     // Subtracting 128 yields negative values for UP and positive for DOWN.
                     // Sunshine/Moonlight expects standard Y-axis coordinates where UP is positive and

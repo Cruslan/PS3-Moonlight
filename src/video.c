@@ -17,8 +17,15 @@
 #include "ui.h"
 #include <Limelight.h>
 #include <rsx/rsx.h>
+#include <rsx/rsx_program.h>
 #include <rsx/gcm_sys.h>
 #include <sys/mutex.h>
+#include "cas_shaders.h"
+
+// Contrast Adaptive Sharpening (CAS) PoC State
+static int cas_initialized = 0;
+static u32 cas_fp_offset = 0;
+static void *cas_fp_vram = NULL;
 
 #define VDEC_MEM_SIZE (10 * 1024 * 1024)
 
@@ -322,8 +329,8 @@ static int ps3_video_setup(int videoFormat, int width, int height,
   config.ppu_thread_prio = 500;
   config.ppu_thread_stack_size = 0x10000;
   config.spu_thread_prio = 250;
-  // Allocate 2 SPUs for hardware-assisted H.264 video decoding
-  config.num_spus = 2;
+  // Allocate 4 SPUs for hardware-assisted H.264 video decoding (1 for entropy + 3 for macroblock reconstruction)
+  config.num_spus = 4;
 
   static opd32 vdec_callback_opd;
   vdecClosure closure;
@@ -346,14 +353,17 @@ static int ps3_video_setup(int videoFormat, int width, int height,
 
     for (int li = 0; li < 5 && !vdec_opened; li++) {
       type.profile_level = profile_levels[li];
-      int rc = vdecOpen(&type, &config, &closure, &vdec_handle);
-      if (rc == 0) {
-        printf("vdecOpen OK: profile_level=%u, mem=%uMB\n", profile_levels[li],
-               mem_sizes[mi]);
-        vdec_opened = 1;
-      } else {
-        printf("vdecOpen failed: profile_level=%u, mem=%uMB, rc=0x%x\n",
-               profile_levels[li], mem_sizes[mi], rc);
+      for (int spu_cnt = 4; spu_cnt >= 2 && !vdec_opened; spu_cnt -= 2) {
+        config.num_spus = spu_cnt;
+        int rc = vdecOpen(&type, &config, &closure, &vdec_handle);
+        if (rc == 0) {
+          printf("vdecOpen OK: profile_level=%u, mem=%uMB, spus=%u\n", profile_levels[li],
+                 mem_sizes[mi], spu_cnt);
+          vdec_opened = 1;
+        } else {
+          printf("vdecOpen failed: profile_level=%u, mem=%uMB, spus=%u, rc=0x%x\n",
+                 profile_levels[li], mem_sizes[mi], spu_cnt, rc);
+        }
       }
     }
   }
@@ -444,6 +454,28 @@ static int ps3_video_setup(int videoFormat, int width, int height,
   } else {
       gcmSetFlipMode(GCM_FLIP_HSYNC);
       printf("PS3 Video Setup: VSync DISABLED (Immediate Flip)\n");
+  }
+
+  // Initialize CAS shader microcode in RSX VRAM if not yet allocated
+  if (!cas_initialized) {
+    const rsxFragmentProgram *fp = (const rsxFragmentProgram *)cas_upscale_fp_bin;
+    void *fp_ucode = NULL;
+    u32 fp_ucode_size = 0;
+    rsxFragmentProgramGetUCode(fp, &fp_ucode, &fp_ucode_size);
+
+    if (fp_ucode && fp_ucode_size > 0) {
+      cas_fp_vram = tiny3d_AllocTexture((fp_ucode_size + 255) & ~255);
+      if (cas_fp_vram) {
+        cas_fp_offset = tiny3d_TextureOffset(cas_fp_vram);
+        memcpy(cas_fp_vram, fp_ucode, fp_ucode_size);
+        __asm__ volatile("sync" ::: "memory");
+        cas_initialized = 1;
+        printf("CAS Upscaler: Installed fragment shader at RSX offset 0x%08x (size=%u bytes)\n",
+               cas_fp_offset, fp_ucode_size);
+      } else {
+        printf("CAS Upscaler: Failed to allocate RSX VRAM for fragment shader!\n");
+      }
+    }
   }
 
   ps3video_start();
@@ -735,23 +767,87 @@ void ps3video_draw() {
       screen_height = video_height;
   }
 
-  tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
+  int upscaler_mode = ui_get_upscaler_mode();
+  if (upscaler_mode == 1 && cas_initialized && ctx) {
+      // Contrast Adaptive Sharpening (CAS) PoC Path
+      tiny3d_DoCmd_Space(128);
 
-  // Top-Left
-  tiny3d_VertexPos(0, 0, 65535);
-  tiny3d_VertexTexture(0.0f, 0.0f);
+      // 1. Direct 1:1 RSX Viewport for Fullscreen Display (glViewport equivalent)
+      f32 vp_scale[4] = { (f32)screen_width * 0.5f, (f32)screen_height * -0.5f, 0.5f, 0.0f };
+      f32 vp_offset[4] = { (f32)screen_width * 0.5f, (f32)screen_height * 0.5f, 0.5f, 0.0f };
+      rsxSetViewport(ctx, 0, 0, (u16)screen_width, (u16)screen_height, 0.0f, 1.0f, vp_scale, vp_offset);
 
-  // Top-Right
-  tiny3d_VertexPos(screen_width, 0, 65535);
-  tiny3d_VertexTexture(1.0f, 0.0f);
+      // 2. Load CAS Fullscreen Quad Vertex Program
+      void *vp_ucode = NULL;
+      u32 vp_ucode_size = 0;
+      rsxVertexProgramGetUCode((const rsxVertexProgram *)cas_quad_vp_bin, &vp_ucode, &vp_ucode_size);
+      rsxLoadVertexProgram(ctx, (const rsxVertexProgram *)cas_quad_vp_bin, vp_ucode);
 
-  // Bottom-Left
-  tiny3d_VertexPos(0, screen_height, 65535);
-  tiny3d_VertexTexture(0.0f, 1.0f);
+      // 3. Load CAS Upscaling Fragment Program from RSX VRAM
+      rsxLoadFragmentProgramLocation(ctx, (const rsxFragmentProgram *)cas_upscale_fp_bin, cas_fp_offset, GCM_LOCATION_RSX);
+      // Explicitly enforce allowTex (bit 15) to guarantee RSX hardware enables texture coordinate interpolation
+      rsxSetFragmentProgramControl(ctx, (const rsxFragmentProgram *)cas_upscale_fp_bin, 1, 0, 0);
 
-  // Bottom-Right
-  tiny3d_VertexPos(screen_width, screen_height, 65535);
-  tiny3d_VertexTexture(1.0f, 1.0f);
+      // 4. Disable Face Culling, Depth Test, and Depth Write so video quad does not pollute the depth buffer
+      rsxSetCullFaceEnable(ctx, GCM_FALSE);
+      rsxSetDepthTestEnable(ctx, GCM_FALSE);
+      rsxSetDepthWriteEnable(ctx, GCM_FALSE);
 
-  tiny3d_End();
+      // 5. Draw Fullscreen Quad with NDC Coordinates (TEXCOORD0 first, POSITION triggers vertex)
+      static const f32 v_tl_uv[2]  = { 0.0f, 0.0f };
+      static const f32 v_tl_pos[2] = {-1.0f,  1.0f };
+
+      static const f32 v_tr_uv[2]  = { 1.0f, 0.0f };
+      static const f32 v_tr_pos[2] = { 1.0f,  1.0f };
+
+      static const f32 v_bl_uv[2]  = { 0.0f, 1.0f };
+      static const f32 v_bl_pos[2] = {-1.0f, -1.0f };
+
+      static const f32 v_br_uv[2]  = { 1.0f, 1.0f };
+      static const f32 v_br_pos[2] = { 1.0f, -1.0f };
+
+      rsxDrawVertexBegin(ctx, GCM_TYPE_TRIANGLE_STRIP);
+      rsxDrawVertex2f(ctx, 8, v_tl_uv);
+      rsxDrawVertex2f(ctx, 0, v_tl_pos);
+
+      rsxDrawVertex2f(ctx, 8, v_tr_uv);
+      rsxDrawVertex2f(ctx, 0, v_tr_pos);
+
+      rsxDrawVertex2f(ctx, 8, v_bl_uv);
+      rsxDrawVertex2f(ctx, 0, v_bl_pos);
+
+      rsxDrawVertex2f(ctx, 8, v_br_uv);
+      rsxDrawVertex2f(ctx, 0, v_br_pos);
+      rsxDrawVertexEnd(ctx);
+
+      // 6. Restore Depth Test and Depth Write state
+      rsxSetDepthTestEnable(ctx, GCM_TRUE);
+      rsxSetDepthWriteEnable(ctx, GCM_TRUE);
+
+      // 7. Invalidate tiny3d state cache and restore 2D projection and viewport for HUD overlay
+      tiny3d_Dirty_Status();
+      tiny3d_UserViewportSurface(1, (float)screen_width, (float)screen_height);
+      tiny3d_Project2D();
+  } else {
+      // Legacy Bilinear Hardware Scaling Path
+      tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
+
+      // Top-Left
+      tiny3d_VertexPos(0, 0, 65535);
+      tiny3d_VertexTexture(0.0f, 0.0f);
+
+      // Top-Right
+      tiny3d_VertexPos(screen_width, 0, 65535);
+      tiny3d_VertexTexture(1.0f, 0.0f);
+
+      // Bottom-Left
+      tiny3d_VertexPos(0, screen_height, 65535);
+      tiny3d_VertexTexture(0.0f, 1.0f);
+
+      // Bottom-Right
+      tiny3d_VertexPos(screen_width, screen_height, 65535);
+      tiny3d_VertexTexture(1.0f, 1.0f);
+
+      tiny3d_End();
+  }
 }

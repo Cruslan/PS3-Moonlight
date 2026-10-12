@@ -23,6 +23,7 @@
 #include "ui.h"
 #include "video.h"
 #include "input.h"
+#include <ps3perf.h>
 
 SYS_PROCESS_PARAM(1001, 0x100000)
 
@@ -43,7 +44,6 @@ int main(int argc, char **argv) {
   (void)argc;
   (void)argv;
   // Ağı başlat
-  // Ağı başlat
   sysModuleLoad(SYSMODULE_NET);
   netInitialize();
   netCtlInit();
@@ -53,6 +53,7 @@ int main(int argc, char **argv) {
 
   // Logger başlat
   net_logger_init();
+  ps3perf_init();
 
   // Çözünürlük Tespiti
   videoState vstate;
@@ -242,6 +243,7 @@ int main(int argc, char **argv) {
             }
             
             vdec_poll();
+            ps3perf_tick(5);
             usleep(1000); // 1000Hz poll: with DIRECT_SUBMIT, vdec_poll drains decoder output for RSX render
           }
         } else {
@@ -259,6 +261,7 @@ int main(int argc, char **argv) {
     }
     
     sysUtilCheckCallback();
+    ps3perf_tick(5);
     usleep(50000);
   }
 
@@ -268,6 +271,7 @@ int main(int argc, char **argv) {
   ps3video_stop();
   ps3input_stop();
   ui_shutdown();
+  ps3perf_shutdown();
   net_logger_shutdown();
   sysUtilUnregisterCallback(0);
   usleep(100000); // 100ms graceful drain for final network sockets
