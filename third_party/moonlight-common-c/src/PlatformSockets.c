@@ -103,12 +103,9 @@ int setNonFatalRecvTimeoutMs(SOCKET s, int timeoutMs) {
 }
 
 int pollSockets(struct pollfd* pollFds, int pollFdsCount, int timeoutMs) {
-#if defined(LC_WINDOWS)
-    // We could have used WSAPoll() but it has some nasty bugs
-    // https://daniel.haxx.se/blog/2012/10/10/wsapoll-is-broken/
-    //
-    // We'll emulate WSAPoll() with select(). Fortunately, Microsoft's definition
-    // of fd_set does not have the same stack corruption hazards that UNIX does.
+#if defined(LC_WINDOWS) || defined(__PPU__)
+    // We emulate poll() with select() to avoid known kernel bugs in PS3 netPoll
+    // and Windows WSAPoll.
     fd_set readFds, writeFds, exceptFds;
     int i, err, nfds;
     struct timeval tv;
@@ -122,15 +119,27 @@ int pollSockets(struct pollfd* pollFds, int pollFdsCount, int timeoutMs) {
         // Clear revents on input like poll() does
         pollFds[i].revents = 0;
 
+#if defined(__PPU__)
+        // On PSL1GHT, socket descriptors have bit 0x40000000 set.
+        // Strip the mask so FD_SET indices remain within fd_set bounds.
+        int s = (int)(pollFds[i].fd & ~0x40000000);
+#else
+        int s = (int)pollFds[i].fd;
+#endif
+
         if (pollFds[i].events & POLLIN) {
-            FD_SET(pollFds[i].fd, &readFds);
+            FD_SET(s, &readFds);
         }
         if (pollFds[i].events & POLLOUT) {
-            FD_SET(pollFds[i].fd, &writeFds);
+            FD_SET(s, &writeFds);
 
             // Windows signals failed connections as an exception,
             // while Linux signals them as writeable.
-            FD_SET(pollFds[i].fd, &exceptFds);
+            FD_SET(s, &exceptFds);
+        }
+
+        if (s >= nfds) {
+            nfds = s + 1;
         }
     }
 
@@ -144,15 +153,20 @@ int pollSockets(struct pollfd* pollFds, int pollFdsCount, int timeoutMs) {
     }
 
     for (i = 0; i < pollFdsCount; i++) {
-        if (FD_ISSET(pollFds[i].fd, &readFds)) {
-            pollFds[i].revents |= POLLRDNORM;
+#if defined(__PPU__)
+        int s = (int)(pollFds[i].fd & ~0x40000000);
+#else
+        int s = (int)pollFds[i].fd;
+#endif
+        if (FD_ISSET(s, &readFds)) {
+            pollFds[i].revents |= (POLLIN | POLLRDNORM);
         }
 
-        if (FD_ISSET(pollFds[i].fd, &writeFds)) {
-            pollFds[i].revents |= POLLWRNORM;
+        if (FD_ISSET(s, &writeFds)) {
+            pollFds[i].revents |= (POLLOUT | POLLWRNORM);
         }
 
-        if (FD_ISSET(pollFds[i].fd, &exceptFds)) {
+        if (FD_ISSET(s, &exceptFds)) {
             pollFds[i].revents |= POLLERR;
         }
     }
@@ -193,16 +207,26 @@ int recvUdpSocket(SOCKET s, char* buffer, int size, bool useSelect) {
 
     do {
 #if defined(__PPU__)
-        // On PS3 libnet, SO_RCVTIMEO is unsupported and raw recvfrom blocks kernel threads indefinitely.
-        // Always poll with 50ms timeout so worker threads can promptly notice cancellations and exit.
-        struct pollfd pfd;
-        pfd.fd = s;
-        pfd.events = POLLIN;
-        err = pollSockets(&pfd, 1, 50);
-        if (err <= 0) {
-            return err;
+        // On PS3 libnet, SO_RCVTIMEO is unsupported.
+        // When useSelect is true (first batch packet / waiting for frame), wait up to 50ms with select().
+        // When useSelect is false (draining subsequent batch packets), drain directly
+        // with MSG_DONTWAIT for peak throughput without any kernel poll/select lock contention.
+        if (useSelect) {
+            struct pollfd pfd;
+            pfd.fd = s;
+            pfd.events = POLLIN;
+            err = pollSockets(&pfd, 1, 50);
+            if (err <= 0) {
+                return err;
+            }
+            err = (int)recvfrom(s, buffer, size, MSG_DONTWAIT, NULL, NULL);
         }
-        err = (int)recvfrom(s, buffer, size, 0, NULL, NULL);
+        else {
+            err = (int)recvfrom(s, buffer, size, MSG_DONTWAIT, NULL, NULL);
+            if (err < 0 && (LastSocketError() == EWOULDBLOCK || LastSocketError() == EAGAIN)) {
+                return 0; // Buffer empty, batch drain complete
+            }
+        }
 #else
         if (useSelect) {
             struct pollfd pfd;

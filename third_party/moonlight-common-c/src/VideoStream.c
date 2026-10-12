@@ -137,12 +137,12 @@ static void VideoReceiveThreadProc(void* context) {
     // opportunities to call vdec_poll() and avoid VDEC back-pressure.
     #ifdef __PPU__
     #define VIDEO_BATCH_SIZE 64
-    #define VIDEO_MAX_PACKET_SIZE 1500
+    #define VIDEO_MAX_PACKET_SIZE 2048
     #else
     #define VIDEO_BATCH_SIZE 32
     #define VIDEO_MAX_PACKET_SIZE 2048
     #endif
-    static char batch_data[VIDEO_BATCH_SIZE][VIDEO_MAX_PACKET_SIZE];
+    static char batch_data[VIDEO_BATCH_SIZE][VIDEO_MAX_PACKET_SIZE] __attribute__((aligned(128)));
     static int  batch_lens[VIDEO_BATCH_SIZE];
 
 #ifdef __PPU__
