@@ -6,6 +6,10 @@
 #include <sys/mutex.h>
 #include <string.h>
 #include <opus_multistream.h>
+#include "spu_opus_bridge.h"
+
+/* Flag indicating whether SPU-accelerated Opus decode is active */
+static int g_use_spu_opus = 0;
 
 /* Number of audio channels for stereo output */
 #define AUDIO_CHANNELS 2
@@ -119,6 +123,12 @@ static int audio_thread_started = 0;
  */
 static void audio_loop(void* arg) {
     (void)arg;
+
+    /* Enable Hardware Flush-to-Zero (Non-IEEE mode) on the audio playback PPU thread.
+     * Audio signals decaying toward zero (silence, fading reverbs) would otherwise trigger
+     * expensive microcode assist traps on IEEE subnormals, causing periodic audio glitches. */
+    __asm__ volatile("mtfsb1 29" ::: "memory");
+
     sys_event_t event;
     u32 current_block = 0;
     float temp_block[AUDIO_CHANNELS * AUDIO_BLOCK_SAMPLES];
@@ -176,6 +186,12 @@ static void ps3_renderer_cleanup() {
     sysEventQueueDestroy(audio_queue, 0);
     sysMutexDestroy(rb_mutex);
     
+    /* Shutdown SPU audio accelerator if it was running */
+    if (g_use_spu_opus) {
+        spu_opus_shutdown();
+        g_use_spu_opus = 0;
+    }
+
     /* Free Opus decoder instance */
     if (opus_decoder) {
         opus_multistream_decoder_destroy(opus_decoder);
@@ -213,20 +229,32 @@ static int ps3_renderer_init(int audioConfiguration, const POPUS_MULTISTREAM_CON
         return -1;
     }
     
-    /* Initialize Opus Multistream Decoder using parameters provided by Moonlight/Sunshine */
-    int error = OPUS_OK;
-    opus_decoder = opus_multistream_decoder_create(
-        opusConfig->sampleRate,
-        opusConfig->channelCount,
-        opusConfig->streams,
-        opusConfig->coupledStreams,
-        opusConfig->mapping,
-        &error
-    );
-    if (!opus_decoder || error != OPUS_OK) {
-        sysMutexDestroy(rb_mutex);
-        audioQuit();
-        return -1;
+    /* Try to initialize SPU-accelerated Opus decode on a dedicated SPE core */
+    int spu_ret = spu_opus_init(opusConfig->sampleRate, opusConfig->channelCount);
+    if (spu_ret == 0) {
+        g_use_spu_opus = 1;
+        printf("[AUDIO] SPU Opus Decoder acceleration active.\n");
+    } else {
+        g_use_spu_opus = 0;
+        printf("[AUDIO] SPU Opus Decoder unavailable (%d), falling back to software Opus decoder.\n", spu_ret);
+    }
+
+    /* If SPU acceleration is not active, initialize host software Opus Multistream Decoder */
+    if (!g_use_spu_opus) {
+        int error = OPUS_OK;
+        opus_decoder = opus_multistream_decoder_create(
+            opusConfig->sampleRate,
+            opusConfig->channelCount,
+            opusConfig->streams,
+            opusConfig->coupledStreams,
+            opusConfig->mapping,
+            &error
+        );
+        if (!opus_decoder || error != OPUS_OK) {
+            sysMutexDestroy(rb_mutex);
+            audioQuit();
+            return -1;
+        }
     }
     
     /* Set up stereo playback with 8 blocks of 256 samples */
@@ -237,8 +265,8 @@ static int ps3_renderer_init(int audioConfiguration, const POPUS_MULTISTREAM_CON
     param.level = 1.0f;
     
     if (audioPortOpen(&param, &audio_port) != 0) {
-        opus_multistream_decoder_destroy(opus_decoder);
-        opus_decoder = NULL;
+        if (g_use_spu_opus) { spu_opus_shutdown(); g_use_spu_opus = 0; }
+        if (opus_decoder) { opus_multistream_decoder_destroy(opus_decoder); opus_decoder = NULL; }
         sysMutexDestroy(rb_mutex);
         audioQuit();
         return -1;
@@ -246,8 +274,8 @@ static int ps3_renderer_init(int audioConfiguration, const POPUS_MULTISTREAM_CON
     
     if (audioGetPortConfig(audio_port, &audio_cfg) != 0) {
         audioPortClose(audio_port);
-        opus_multistream_decoder_destroy(opus_decoder);
-        opus_decoder = NULL;
+        if (g_use_spu_opus) { spu_opus_shutdown(); g_use_spu_opus = 0; }
+        if (opus_decoder) { opus_multistream_decoder_destroy(opus_decoder); opus_decoder = NULL; }
         sysMutexDestroy(rb_mutex);
         audioQuit();
         return -1;
@@ -256,8 +284,8 @@ static int ps3_renderer_init(int audioConfiguration, const POPUS_MULTISTREAM_CON
     /* Create event queue for block-completion notifications from the audio hardware */
     if (audioCreateNotifyEventQueue(&audio_queue, &audio_key) != 0) {
         audioPortClose(audio_port);
-        opus_multistream_decoder_destroy(opus_decoder);
-        opus_decoder = NULL;
+        if (g_use_spu_opus) { spu_opus_shutdown(); g_use_spu_opus = 0; }
+        if (opus_decoder) { opus_multistream_decoder_destroy(opus_decoder); opus_decoder = NULL; }
         sysMutexDestroy(rb_mutex);
         audioQuit();
         return -1;
@@ -267,8 +295,8 @@ static int ps3_renderer_init(int audioConfiguration, const POPUS_MULTISTREAM_CON
         audioRemoveNotifyEventQueue(audio_key);
         sysEventQueueDestroy(audio_queue, 0);
         audioPortClose(audio_port);
-        opus_multistream_decoder_destroy(opus_decoder);
-        opus_decoder = NULL;
+        if (g_use_spu_opus) { spu_opus_shutdown(); g_use_spu_opus = 0; }
+        if (opus_decoder) { opus_multistream_decoder_destroy(opus_decoder); opus_decoder = NULL; }
         sysMutexDestroy(rb_mutex);
         audioQuit();
         return -1;
@@ -280,8 +308,8 @@ static int ps3_renderer_init(int audioConfiguration, const POPUS_MULTISTREAM_CON
         audioRemoveNotifyEventQueue(audio_key);
         sysEventQueueDestroy(audio_queue, 0);
         audioPortClose(audio_port);
-        opus_multistream_decoder_destroy(opus_decoder);
-        opus_decoder = NULL;
+        if (g_use_spu_opus) { spu_opus_shutdown(); g_use_spu_opus = 0; }
+        if (opus_decoder) { opus_multistream_decoder_destroy(opus_decoder); opus_decoder = NULL; }
         sysMutexDestroy(rb_mutex);
         audioQuit();
         return -1;
@@ -295,8 +323,8 @@ static int ps3_renderer_init(int audioConfiguration, const POPUS_MULTISTREAM_CON
         audioRemoveNotifyEventQueue(audio_key);
         sysEventQueueDestroy(audio_queue, 0);
         audioPortClose(audio_port);
-        opus_multistream_decoder_destroy(opus_decoder);
-        opus_decoder = NULL;
+        if (g_use_spu_opus) { spu_opus_shutdown(); g_use_spu_opus = 0; }
+        if (opus_decoder) { opus_multistream_decoder_destroy(opus_decoder); opus_decoder = NULL; }
         sysMutexDestroy(rb_mutex);
         audioQuit();
         return -1;
@@ -311,20 +339,37 @@ static int ps3_renderer_init(int audioConfiguration, const POPUS_MULTISTREAM_CON
  * Decode incoming Opus packet into float PCM samples and push them into the ring buffer.
  */
 static void ps3_renderer_decode_and_play_sample(char* data, int length) {
-    if (!opus_decoder) return;
-    
-    /* Decode the raw Opus multistream packet directly to float PCM */
-    int decoded_samples = opus_multistream_decode_float(
-        opus_decoder,
-        (data && length > 0) ? (const unsigned char*)data : NULL,
-        length,
-        decode_buffer,
-        MAX_OPUS_FRAME_SIZE,
-        0
-    );
-    if (decoded_samples < 0) {
-        /* Failed to decode the Opus frame */
-        return;
+    int decoded_samples = 0;
+
+    if (g_use_spu_opus) {
+        /* Offload Opus decode and int16-to-float conversion to dedicated SPE core */
+        int ret = spu_opus_decode_float(
+            data,
+            length,
+            decode_buffer,
+            MAX_OPUS_FRAME_SIZE,
+            &decoded_samples
+        );
+        if (ret != 0 || decoded_samples <= 0) {
+            /* SPU decode failure or empty packet */
+            return;
+        }
+    } else {
+        if (!opus_decoder) return;
+        
+        /* Fallback: Decode the raw Opus multistream packet directly on host */
+        decoded_samples = opus_multistream_decode_float(
+            opus_decoder,
+            (data && length > 0) ? (const unsigned char*)data : NULL,
+            length,
+            decode_buffer,
+            MAX_OPUS_FRAME_SIZE,
+            0
+        );
+        if (decoded_samples < 0) {
+            /* Failed to decode the Opus frame */
+            return;
+        }
     }
     
     /* Push the stereo samples (decoded_samples * channels) into the playback FIFO buffer */

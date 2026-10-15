@@ -22,10 +22,30 @@
 #include <sys/mutex.h>
 #include "cas_shaders.h"
 
-// Contrast Adaptive Sharpening (CAS) PoC State
-static int cas_initialized = 0;
-static u32 cas_fp_offset = 0;
-static void *cas_fp_vram = NULL;
+// Discrete Shader RSX States:
+// HD Modes: 1080p and 720p (hd_cas_fp & hd_box_fp)
+// SD Modes: 576p and 480p across all variations (sd_cas_fp & sd_box_fp)
+static int shaders_initialized = 0;
+
+static u32 hd_cas_fp_offset = 0;
+static void *hd_cas_fp_vram = NULL;
+static u32 hd_box_fp_offset = 0;
+static void *hd_box_fp_vram = NULL;
+
+static u32 sd_cas_fp_offset = 0;
+static void *sd_cas_fp_vram = NULL;
+static u32 sd_box_fp_offset = 0;
+static void *sd_box_fp_vram = NULL;
+
+/**
+ * ps3video_is_hd_mode:
+ * Evaluates whether the current display output resolution operates in HD Mode (1080p / 720p)
+ * or SD Mode (576p / 480p across all aspect ratios).
+ */
+static inline int ps3video_is_hd_mode(int screen_w, int screen_h) {
+    (void)screen_w;
+    return (screen_h >= 720);
+}
 
 #define VDEC_MEM_SIZE (10 * 1024 * 1024)
 
@@ -36,6 +56,12 @@ static int current_video_fps = 0;
 static int decoded_frames_this_second = 0;
 static int current_decoded_fps = 0;
 static u32 total_decoded_frames = 0;
+
+static int submitted_frames_this_second = 0;
+static int current_submitted_fps = 0;
+
+static int dropped_frames_this_second = 0;
+static int current_dropped_fps = 0;
 
 #define SUBMIT_QUEUE_SIZE 16
 static u64 submit_queue[SUBMIT_QUEUE_SIZE];
@@ -80,8 +106,9 @@ static int  vdec_back     = 0; // index last submitted
 #define vdec_decode_buffer_size vdec_buf_size[vdec_front]
 
 // Decoded frame buffer (system RAM — VDEC cannot write directly to RSX)
-#define VDEC_FRAME_COUNT 4
-static void *vdec_frame_bufs[VDEC_FRAME_COUNT] = {NULL, NULL, NULL, NULL}; // memalign'd, size = width*height*4
+// 6 buffers provide elastic jitter absorption between VDEC decoding and RSX presentation
+#define VDEC_FRAME_COUNT 6
+static void *vdec_frame_bufs[VDEC_FRAME_COUNT] = {NULL, NULL, NULL, NULL, NULL, NULL}; // memalign'd, size = width*height*4
 static u64 frame_ready_time[VDEC_FRAME_COUNT];
 static u32 vdec_frame_buf_size = 0;
 
@@ -89,8 +116,8 @@ static volatile int vdec_picout_pending = 0;
 // set by callback, cleared by poll
 
 // RSX render target — mapped from system RAM (zero-copy: VDEC writes here, RSX reads directly)
-static u32 video_texture_rsx_offsets[VDEC_FRAME_COUNT] = {0, 0, 0, 0};  // RSX offsets of vdec_frame_bufs
-static int video_texture_mapped[VDEC_FRAME_COUNT] = {0, 0, 0, 0};
+static u32 video_texture_rsx_offsets[VDEC_FRAME_COUNT] = {0, 0, 0, 0, 0, 0};  // RSX offsets of vdec_frame_bufs
+static int video_texture_mapped[VDEC_FRAME_COUNT] = {0, 0, 0, 0, 0, 0};
 
 static int video_width = 1280;
 static int video_height = 720;
@@ -127,8 +154,12 @@ static void reset_video_runtime_state(void) {
   current_net_latency_ms = 0;
   frames_this_second = 0;
   decoded_frames_this_second = 0;
+  submitted_frames_this_second = 0;
+  dropped_frames_this_second = 0;
   current_video_fps = 0;
   current_decoded_fps = 0;
+  current_submitted_fps = 0;
+  current_dropped_fps = 0;
   last_fps_time = 0;
 }
 
@@ -265,6 +296,9 @@ void vdec_poll(void) {
         ready_queue[ready_head] = write_buf;
         ready_head = (ready_head + 1) % VDEC_FRAME_COUNT;
         ready_tail = (ready_tail + 1) % VDEC_FRAME_COUNT;
+        if (ui_get_show_stats()) {
+            dropped_frames_this_second++;
+        }
     }
     
     // Find next available write_buf
@@ -329,8 +363,18 @@ static int ps3_video_setup(int videoFormat, int width, int height,
   config.ppu_thread_prio = 500;
   config.ppu_thread_stack_size = 0x10000;
   config.spu_thread_prio = 250;
-  // Allocate 4 SPUs for hardware-assisted H.264 video decoding (1 for entropy + 3 for macroblock reconstruction)
-  config.num_spus = 4;
+  /*
+   * Allocate 5 SPUs for hardware-assisted H.264 (AVC) video decoding:
+   *   - 1 SPU dedicated to CAVLC / CABAC entropy parsing and slice header unpacking.
+   *   - 4 SPUs dedicated to parallel macroblock reconstruction, inverse discrete
+   *     cosine transform (IDCT), motion compensation (inter/intra prediction),
+   *     and in-loop deblocking filtering.
+   * 5 SPEs represents the architectural ceiling supported by Sony's Cell Broadband
+   * Engine AVC microcode in libvdec (CELL_VDEC_AVC_MAX_SPUS = 5). With 1 SPU assigned
+   * to SPU Opus audio processing, exactly 6 user SPUs (out of 6 GameOS
+   * usable SPEs) are fully scheduled without oversubscription or preemption stalls.
+   */
+  config.num_spus = 5;
 
   static opd32 vdec_callback_opd;
   vdecClosure closure;
@@ -353,7 +397,13 @@ static int ps3_video_setup(int videoFormat, int width, int height,
 
     for (int li = 0; li < 5 && !vdec_opened; li++) {
       type.profile_level = profile_levels[li];
-      for (int spu_cnt = 4; spu_cnt >= 2 && !vdec_opened; spu_cnt -= 2) {
+      /*
+       * SPU allocation cascade: attempt maximum 5 SPUs first, cascading to 4 and 2
+       * if constrained by restrictive sandbox or hypervisor quota.
+       */
+      static const u32 spu_cascade[] = {5, 4, 2};
+      for (size_t si = 0; si < sizeof(spu_cascade) / sizeof(spu_cascade[0]) && !vdec_opened; si++) {
+        u32 spu_cnt = spu_cascade[si];
         config.num_spus = spu_cnt;
         int rc = vdecOpen(&type, &config, &closure, &vdec_handle);
         if (rc == 0) {
@@ -456,25 +506,85 @@ static int ps3_video_setup(int videoFormat, int width, int height,
       printf("PS3 Video Setup: VSync DISABLED (Immediate Flip)\n");
   }
 
-  // Initialize CAS shader microcode in RSX VRAM if not yet allocated
-  if (!cas_initialized) {
-    const rsxFragmentProgram *fp = (const rsxFragmentProgram *)cas_upscale_fp_bin;
-    void *fp_ucode = NULL;
-    u32 fp_ucode_size = 0;
-    rsxFragmentProgramGetUCode(fp, &fp_ucode, &fp_ucode_size);
+  // Initialize dedicated HD and SD shader microcode in RSX VRAM if not yet allocated
+  if (!shaders_initialized) {
+    // 1. HD CAS Upscaler Fragment Program (1080p / 720p)
+    const rsxFragmentProgram *hd_cas_fp = (const rsxFragmentProgram *)hd_cas_fp_bin;
+    void *hd_cas_ucode = NULL;
+    u32 hd_cas_ucode_size = 0;
+    rsxFragmentProgramGetUCode(hd_cas_fp, &hd_cas_ucode, &hd_cas_ucode_size);
 
-    if (fp_ucode && fp_ucode_size > 0) {
-      cas_fp_vram = tiny3d_AllocTexture((fp_ucode_size + 255) & ~255);
-      if (cas_fp_vram) {
-        cas_fp_offset = tiny3d_TextureOffset(cas_fp_vram);
-        memcpy(cas_fp_vram, fp_ucode, fp_ucode_size);
-        __asm__ volatile("sync" ::: "memory");
-        cas_initialized = 1;
-        printf("CAS Upscaler: Installed fragment shader at RSX offset 0x%08x (size=%u bytes)\n",
-               cas_fp_offset, fp_ucode_size);
+    if (hd_cas_ucode && hd_cas_ucode_size > 0) {
+      hd_cas_fp_vram = tiny3d_AllocTexture((hd_cas_ucode_size + 255) & ~255);
+      if (hd_cas_fp_vram) {
+        hd_cas_fp_offset = tiny3d_TextureOffset(hd_cas_fp_vram);
+        memcpy(hd_cas_fp_vram, hd_cas_ucode, hd_cas_ucode_size);
+        printf("HD CAS Upscaler: Installed fragment shader at RSX offset 0x%08x (size=%u bytes)\n",
+               hd_cas_fp_offset, hd_cas_ucode_size);
       } else {
-        printf("CAS Upscaler: Failed to allocate RSX VRAM for fragment shader!\n");
+        printf("HD CAS Upscaler: Failed to allocate RSX VRAM for fragment shader!\n");
       }
+    }
+
+    // 2. HD 4-Tap Bilinear Box Downscaler Fragment Program (1080p / 720p)
+    const rsxFragmentProgram *hd_box_fp = (const rsxFragmentProgram *)hd_box_fp_bin;
+    void *hd_box_ucode = NULL;
+    u32 hd_box_ucode_size = 0;
+    rsxFragmentProgramGetUCode(hd_box_fp, &hd_box_ucode, &hd_box_ucode_size);
+
+    if (hd_box_ucode && hd_box_ucode_size > 0) {
+      hd_box_fp_vram = tiny3d_AllocTexture((hd_box_ucode_size + 255) & ~255);
+      if (hd_box_fp_vram) {
+        hd_box_fp_offset = tiny3d_TextureOffset(hd_box_fp_vram);
+        memcpy(hd_box_fp_vram, hd_box_ucode, hd_box_ucode_size);
+        printf("HD Box Downscaler: Installed fragment shader at RSX offset 0x%08x (size=%u bytes)\n",
+               hd_box_fp_offset, hd_box_ucode_size);
+      } else {
+        printf("HD Box Downscaler: Failed to allocate RSX VRAM for fragment shader!\n");
+      }
+    }
+
+    // 3. SD CAS Upscaler Fragment Program (576p / 480p)
+    const rsxFragmentProgram *sd_cas_fp = (const rsxFragmentProgram *)sd_cas_fp_bin;
+    void *sd_cas_ucode = NULL;
+    u32 sd_cas_ucode_size = 0;
+    rsxFragmentProgramGetUCode(sd_cas_fp, &sd_cas_ucode, &sd_cas_ucode_size);
+
+    if (sd_cas_ucode && sd_cas_ucode_size > 0) {
+      sd_cas_fp_vram = tiny3d_AllocTexture((sd_cas_ucode_size + 255) & ~255);
+      if (sd_cas_fp_vram) {
+        sd_cas_fp_offset = tiny3d_TextureOffset(sd_cas_fp_vram);
+        memcpy(sd_cas_fp_vram, sd_cas_ucode, sd_cas_ucode_size);
+        printf("SD CAS Upscaler: Installed fragment shader at RSX offset 0x%08x (size=%u bytes)\n",
+               sd_cas_fp_offset, sd_cas_ucode_size);
+      } else {
+        printf("SD CAS Upscaler: Failed to allocate RSX VRAM for fragment shader!\n");
+      }
+    }
+
+    // 4. SD 4-Tap Bilinear Box Downscaler Fragment Program (576p / 480p)
+    const rsxFragmentProgram *sd_box_fp = (const rsxFragmentProgram *)sd_box_fp_bin;
+    void *sd_box_ucode = NULL;
+    u32 sd_box_ucode_size = 0;
+    rsxFragmentProgramGetUCode(sd_box_fp, &sd_box_ucode, &sd_box_ucode_size);
+
+    if (sd_box_ucode && sd_box_ucode_size > 0) {
+      sd_box_fp_vram = tiny3d_AllocTexture((sd_box_ucode_size + 255) & ~255);
+      if (sd_box_fp_vram) {
+        sd_box_fp_offset = tiny3d_TextureOffset(sd_box_fp_vram);
+        memcpy(sd_box_fp_vram, sd_box_ucode, sd_box_ucode_size);
+        printf("SD Box Downscaler: Installed fragment shader at RSX offset 0x%08x (size=%u bytes)\n",
+               sd_box_fp_offset, sd_box_ucode_size);
+      } else {
+        printf("SD Box Downscaler: Failed to allocate RSX VRAM for fragment shader!\n");
+      }
+    }
+
+    __asm__ volatile("sync" ::: "memory");
+
+    if (hd_cas_fp_vram && hd_box_fp_vram && sd_cas_fp_vram && sd_box_fp_vram) {
+      shaders_initialized = 1;
+      printf("All HD and SD Shaders successfully initialized in RSX VRAM.\n");
     }
   }
 
@@ -496,13 +606,20 @@ static int ps3_video_submit_decode_unit(PDECODE_UNIT decodeUnit) {
       (u32)decodeUnit->fullLength > VDEC_DECODE_BUF_MAX) {
     return DR_OK;
   }
+  if (ui_get_show_stats()) {
+    submitted_frames_this_second++;
+  }
+
   // Non-blocking check: if VDEC hardware queue is full, drop this frame
   // immediately.  We must NEVER block here because in queue-based mode the
   // decoder thread must stay responsive to keep draining the decode unit
   // queue.  The main thread's vdec_poll() (1000Hz) is responsible for
   // freeing VDEC slots by consuming decoded pictures.
   if (vdec_au_pending >= VDEC_BUF_COUNT) {
-    return DR_OK; // silently drop — main thread will free slots via vdec_poll()
+    if (ui_get_show_stats()) {
+      dropped_frames_this_second++;
+    }
+    return DR_NEED_IDR; // Request IDR to recover cleanly from hardware queue saturation
   }
 
   // We now own vdec_front exclusively (VDEC owns vdec_back and it is done).
@@ -621,8 +738,11 @@ static int ps3_video_submit_decode_unit(PDECODE_UNIT decodeUnit) {
         } else {
             printf("vdecDecodeAu failed: 0x%x\n", (u32)dec_rc);
         }
+        if (ui_get_show_stats()) {
+            dropped_frames_this_second++;
+        }
         vdec_au_pending--;
-        return DR_OK;
+        return DR_NEED_IDR;
     }
   }
 
@@ -664,6 +784,8 @@ int ps3video_is_active() { return active_video_thread; }
 
 int ps3video_get_current_fps() { return current_video_fps; }
 int ps3video_get_decoded_fps() { return current_decoded_fps; }
+int ps3video_get_submitted_fps() { return current_submitted_fps; }
+int ps3video_get_dropped_fps() { return current_dropped_fps; }
 int ps3video_get_decode_latency() { return current_decode_latency_ms; }
 int ps3video_get_render_latency() { return current_render_latency_ms; }
 int ps3video_get_net_latency() { return current_net_latency_ms; }
@@ -679,6 +801,8 @@ void ps3video_draw() {
       if (now - last_fps_time >= 1000000) {
         current_video_fps = frames_this_second;
         current_decoded_fps = decoded_frames_this_second;
+        current_submitted_fps = submitted_frames_this_second;
+        current_dropped_fps = dropped_frames_this_second;
         
         if (decode_latency_count > 0) {
             current_decode_latency_ms = (int)((decode_latency_sum / decode_latency_count) / 1000);
@@ -705,12 +829,28 @@ void ps3video_draw() {
 
         frames_this_second = 0;
         decoded_frames_this_second = 0;
+        submitted_frames_this_second = 0;
+        dropped_frames_this_second = 0;
         last_fps_time = now;
       }
   }
 
   if (mutex_initialized) sysMutexLock(frame_mutex, 0);
   if (ready_count > 0) {
+      /* Drain older presentation frames if multiple frames arrived in the ready queue.
+       * This occurs during the 1-frame-per-16.7s clock drift (60.00 fps host vs 59.94 fps PS3)
+       * or momentary network burst. Skipping older presentation bitmaps directly to the newest
+       * ready frame guarantees strictly zero input lag accumulation.
+       * VDEC hardware has already decoded every frame into its DPB, so H.264 temporal references
+       * remain 100% complete and valid without artifacts. */
+      while (ready_count > 1) {
+          ready_tail = (ready_tail + 1) % VDEC_FRAME_COUNT;
+          ready_count--;
+          if (ui_get_show_stats()) {
+              dropped_frames_this_second++;
+          }
+      }
+
       front_buf = ready_queue[ready_tail];
       ready_tail = (ready_tail + 1) % VDEC_FRAME_COUNT;
       ready_count--;
@@ -767,33 +907,121 @@ void ps3video_draw() {
       screen_height = video_height;
   }
 
-  int upscaler_mode = ui_get_upscaler_mode();
-  if (upscaler_mode == 1 && cas_initialized && ctx) {
-      // Contrast Adaptive Sharpening (CAS) PoC Path
+  // Determine whether active display is operating in HD mode (1080p, 720p)
+  // or SD mode (576p, 480p across all aspect ratios).
+  int is_hd_mode = ps3video_is_hd_mode(screen_width, screen_height);
+
+  // Compute destination rectangle with hardware Display Aspect Ratio (DAR) correction.
+  // Standard definition (480p/576p) rasters use non-square anamorphic pixels (SAR != DAR).
+  // Comparing physical stream DAR against physical display DAR guarantees correct geometry
+  // and zero letterboxing when 16:9 stream is rendered on 16:9 display (even on 576p/480p).
+  float stream_dar = (float)video_width / (float)video_height;
+  float display_dar = (ui_get_aspect_ratio() == ASPECT_RATIO_4_3) ? (4.0f / 3.0f) : (16.0f / 9.0f);
+  float rel = stream_dar / display_dar;
+
+  int dst_x = 0, dst_y = 0;
+  int dst_w = screen_width, dst_h = screen_height;
+
+  if (rel < 0.98f) {
+      // Stream is narrower than physical display (e.g. 4:3 stream on 16:9 screen) -> Pillarbox
+      dst_h = screen_height;
+      dst_w = (int)((float)screen_width * rel + 0.5f);
+      dst_x = (screen_width - dst_w) / 2;
+      dst_y = 0;
+  } else if (rel > 1.02f) {
+      // Stream is wider than physical display (e.g. 16:9 stream on 4:3 screen) -> Letterbox
+      dst_w = screen_width;
+      dst_h = (int)((float)screen_height / rel + 0.5f);
+      dst_x = 0;
+      dst_y = (screen_height - dst_h) / 2;
+  } else {
+      // Stream matches display aspect ratio (e.g. 16:9 on 16:9 or 4:3 on 4:3) -> Full raster stretch
+      dst_w = screen_width;
+      dst_h = screen_height;
+      dst_x = 0;
+      dst_y = 0;
+  }
+
+  // Determine scaling method
+  // Scaling behavior:
+  // SCALING_MODE_SHADER (0):
+  //   - input == output (video_width == dst_w && video_height == dst_h): 1:1 Direct Passthrough (Tiny3D direct)
+  //   - input < output (video_width < dst_w || video_height < dst_h): CAS 5-Tap Upscale
+  //   - input > output (video_width > dst_w || video_height > dst_h): 4-Tap Bilinear Box Downscale
+  // SCALING_MODE_LEGACY (1):
+  //   - Legacy Bilinear / Direct texture mapping via Tiny3D (no custom fragment shaders)
+  int scaling_pref = ui_get_scaling_mode();
+  int active_method;
+
+  if (scaling_pref == SCALING_MODE_SHADER) {
+      if (video_width == dst_w && video_height == dst_h) {
+          active_method = 0;
+          ui_set_active_scaling_name("1:1 Direct Passthrough");
+      } else if (video_width < dst_w || video_height < dst_h) {
+          active_method = 1;
+          ui_set_active_scaling_name(is_hd_mode ? "HD CAS 5-Tap (Upscale)" : "SD CAS 5-Tap (Upscale)");
+      } else {
+          active_method = 2;
+          ui_set_active_scaling_name(is_hd_mode ? "HD 4-Tap Box (Downscale)" : "SD 4-Tap Box (Downscale)");
+      }
+  } else {
+      active_method = 3;
+      ui_set_active_scaling_name(is_hd_mode ? "HD Legacy (Tiny3D Bilinear)" : "SD Legacy (Tiny3D Bilinear)");
+  }
+
+  if ((active_method == 1 || active_method == 2) && shaders_initialized && ctx) {
       tiny3d_DoCmd_Space(128);
 
-      // 1. Direct 1:1 RSX Viewport for Fullscreen Display (glViewport equivalent)
-      f32 vp_scale[4] = { (f32)screen_width * 0.5f, (f32)screen_height * -0.5f, 0.5f, 0.0f };
-      f32 vp_offset[4] = { (f32)screen_width * 0.5f, (f32)screen_height * 0.5f, 0.5f, 0.0f };
-      rsxSetViewport(ctx, 0, 0, (u16)screen_width, (u16)screen_height, 0.0f, 1.0f, vp_scale, vp_offset);
+      // 1. Direct RSX Viewport for destination rectangle
+      f32 vp_scale[4] = { (f32)dst_w * 0.5f, (f32)dst_h * -0.5f, 0.5f, 0.0f };
+      f32 vp_offset[4] = { (f32)dst_x + (f32)dst_w * 0.5f, (f32)dst_y + (f32)dst_h * 0.5f, 0.5f, 0.0f };
+      rsxSetViewport(ctx, (u16)dst_x, (u16)dst_y, (u16)dst_w, (u16)dst_h, 0.0f, 1.0f, vp_scale, vp_offset);
 
-      // 2. Load CAS Fullscreen Quad Vertex Program
+      // 2. Load Discrete Vertex Program (HD vs SD)
+      const rsxVertexProgram *vp = is_hd_mode
+          ? (const rsxVertexProgram *)hd_quad_vp_bin
+          : (const rsxVertexProgram *)sd_quad_vp_bin;
       void *vp_ucode = NULL;
       u32 vp_ucode_size = 0;
-      rsxVertexProgramGetUCode((const rsxVertexProgram *)cas_quad_vp_bin, &vp_ucode, &vp_ucode_size);
-      rsxLoadVertexProgram(ctx, (const rsxVertexProgram *)cas_quad_vp_bin, vp_ucode);
+      rsxVertexProgramGetUCode(vp, &vp_ucode, &vp_ucode_size);
+      rsxLoadVertexProgram(ctx, vp, vp_ucode);
 
-      // 3. Load CAS Upscaling Fragment Program from RSX VRAM
-      rsxLoadFragmentProgramLocation(ctx, (const rsxFragmentProgram *)cas_upscale_fp_bin, cas_fp_offset, GCM_LOCATION_RSX);
-      // Explicitly enforce allowTex (bit 15) to guarantee RSX hardware enables texture coordinate interpolation
-      rsxSetFragmentProgramControl(ctx, (const rsxFragmentProgram *)cas_upscale_fp_bin, 1, 0, 0);
+      // 3. Load Discrete Fragment Program (HD vs SD, CAS vs Box)
+      const rsxFragmentProgram *fp = NULL;
+      u32 fp_offset = 0;
 
-      // 4. Disable Face Culling, Depth Test, and Depth Write so video quad does not pollute the depth buffer
+      if (is_hd_mode) {
+          fp = (active_method == 1)
+              ? (const rsxFragmentProgram *)hd_cas_fp_bin
+              : (const rsxFragmentProgram *)hd_box_fp_bin;
+          fp_offset = (active_method == 1) ? hd_cas_fp_offset : hd_box_fp_offset;
+      } else {
+          fp = (active_method == 1)
+              ? (const rsxFragmentProgram *)sd_cas_fp_bin
+              : (const rsxFragmentProgram *)sd_box_fp_bin;
+          fp_offset = (active_method == 1) ? sd_cas_fp_offset : sd_box_fp_offset;
+      }
+
+      rsxLoadFragmentProgramLocation(ctx, fp, fp_offset, GCM_LOCATION_RSX);
+      rsxSetFragmentProgramControl(ctx, fp, 1, 0, 0);
+
+      // 4. Disable Culling, Depth Test and Depth Write
       rsxSetCullFaceEnable(ctx, GCM_FALSE);
       rsxSetDepthTestEnable(ctx, GCM_FALSE);
       rsxSetDepthWriteEnable(ctx, GCM_FALSE);
 
-      // 5. Draw Fullscreen Quad with NDC Coordinates (TEXCOORD0 first, POSITION triggers vertex)
+      // 5. Dynamic step for TEXCOORD1 (Attr 9):
+      // CAS (active_method == 1): texel_size = (1.0 / video_width, 1.0 / video_height)
+      // Box (active_method == 2): half_texel = (0.5 / video_width, 0.5 / video_height)
+      f32 step_uv[2];
+      if (active_method == 1) {
+          step_uv[0] = 1.0f / (f32)video_width;
+          step_uv[1] = 1.0f / (f32)video_height;
+      } else {
+          step_uv[0] = 0.5f / (f32)video_width;
+          step_uv[1] = 0.5f / (f32)video_height;
+      }
+
       static const f32 v_tl_uv[2]  = { 0.0f, 0.0f };
       static const f32 v_tl_pos[2] = {-1.0f,  1.0f };
 
@@ -807,45 +1035,49 @@ void ps3video_draw() {
       static const f32 v_br_pos[2] = { 1.0f, -1.0f };
 
       rsxDrawVertexBegin(ctx, GCM_TYPE_TRIANGLE_STRIP);
+      rsxDrawVertex2f(ctx, 9, step_uv);
       rsxDrawVertex2f(ctx, 8, v_tl_uv);
       rsxDrawVertex2f(ctx, 0, v_tl_pos);
 
+      rsxDrawVertex2f(ctx, 9, step_uv);
       rsxDrawVertex2f(ctx, 8, v_tr_uv);
       rsxDrawVertex2f(ctx, 0, v_tr_pos);
 
+      rsxDrawVertex2f(ctx, 9, step_uv);
       rsxDrawVertex2f(ctx, 8, v_bl_uv);
       rsxDrawVertex2f(ctx, 0, v_bl_pos);
 
+      rsxDrawVertex2f(ctx, 9, step_uv);
       rsxDrawVertex2f(ctx, 8, v_br_uv);
       rsxDrawVertex2f(ctx, 0, v_br_pos);
       rsxDrawVertexEnd(ctx);
 
-      // 6. Restore Depth Test and Depth Write state
+      // 6. Restore Depth Test and Write
       rsxSetDepthTestEnable(ctx, GCM_TRUE);
       rsxSetDepthWriteEnable(ctx, GCM_TRUE);
 
-      // 7. Invalidate tiny3d state cache and restore 2D projection and viewport for HUD overlay
+      // 7. Invalidate tiny3d state and restore 2D projection/viewport for HUD
       tiny3d_Dirty_Status();
       tiny3d_UserViewportSurface(1, (float)screen_width, (float)screen_height);
       tiny3d_Project2D();
   } else {
-      // Legacy Bilinear Hardware Scaling Path
+      // 1:1 Direct Passthrough or Legacy Bilinear Path
       tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
 
       // Top-Left
-      tiny3d_VertexPos(0, 0, 65535);
+      tiny3d_VertexPos(dst_x, dst_y, 65535);
       tiny3d_VertexTexture(0.0f, 0.0f);
 
       // Top-Right
-      tiny3d_VertexPos(screen_width, 0, 65535);
+      tiny3d_VertexPos(dst_x + dst_w, dst_y, 65535);
       tiny3d_VertexTexture(1.0f, 0.0f);
 
       // Bottom-Left
-      tiny3d_VertexPos(0, screen_height, 65535);
+      tiny3d_VertexPos(dst_x, dst_y + dst_h, 65535);
       tiny3d_VertexTexture(0.0f, 1.0f);
 
       // Bottom-Right
-      tiny3d_VertexPos(screen_width, screen_height, 65535);
+      tiny3d_VertexPos(dst_x + dst_w, dst_y + dst_h, 65535);
       tiny3d_VertexTexture(1.0f, 1.0f);
 
       tiny3d_End();

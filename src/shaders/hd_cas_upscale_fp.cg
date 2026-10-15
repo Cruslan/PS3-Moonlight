@@ -1,0 +1,61 @@
+// AMD Contrast Adaptive Sharpening (CAS) tailored for HD Modes (1080p / 720p) on PS3 RSX (fp40 profile)
+// Real-time video stream upscaling with dynamic texel dimensions via TEXCOORD1.
+// Uses half-precision (fp16) arithmetic for maximum vector ALU throughput on NV47 pipelines.
+//
+// Formulation:
+// Division-free contrast-adaptive unsharp mask:
+//   contrast = max(luma) - min(luma)
+//   w = -0.125 * saturate(1.0 - contrast * 2.0)
+//   sharp = e + (b + d + f + h - 4.0 * e) * w
+//
+// Mathematical Rationale:
+// The effective kernel weights are:
+//   Center (e): 1.0 - 4.0 * w
+//   Cross taps (b, d, f, h): w each
+//   Sum of weights: (1.0 - 4.0 * w) + 4.0 * w = 1.0 identically.
+// This completely eliminates color drift, DC gain shifts, and the need for
+// normalization division, avoiding compiler constant-pool zero-division bugs in cgc fp40.
+
+struct vOut {
+    float4 pos : POSITION;
+    float2 uv  : TEXCOORD0;
+    float2 ts  : TEXCOORD1; // dynamic texel size (1.0 / width, 1.0 / height)
+};
+
+float4 main(vOut IN, uniform sampler2D tex : TEXUNIT0) : COLOR
+{
+    float2 uv = IN.uv;
+    float2 ts = IN.ts;
+
+    // 5-tap cross neighborhood sampling on dynamic video texture
+    half3 e = tex2D(tex, uv).rgb;
+    half3 b = tex2D(tex, uv - float2(0.0, ts.y)).rgb;
+    half3 d = tex2D(tex, uv - float2(ts.x, 0.0)).rgb;
+    half3 f = tex2D(tex, uv + float2(ts.x, 0.0)).rgb;
+    half3 h = tex2D(tex, uv + float2(0.0, ts.y)).rgb;
+
+    // Rec.709 Luma extraction via dot product
+    const half3 luma_weights = half3(0.2126, 0.7152, 0.0722);
+    half b_l = dot(b, luma_weights);
+    half d_l = dot(d, luma_weights);
+    half e_l = dot(e, luma_weights);
+    half f_l = dot(f, luma_weights);
+    half h_l = dot(h, luma_weights);
+
+    // Local min and max contrast bounds
+    half mn = min(min(b_l, d_l), min(f_l, h_l));
+    half mx = max(max(b_l, d_l), max(f_l, h_l));
+    half mn2 = min(mn, e_l);
+    half mx2 = max(mx, e_l);
+
+    // Contrast-adaptive sharpening weight:
+    // If local contrast is high (sharp edges), contrast * 2 >= 1.0 -> w = 0 (prevents ringing)
+    // If local contrast is low (soft textures/details), w transitions smoothly to -0.125
+    half contrast = mx2 - mn2;
+    half w = -0.125 * saturate(1.0 - contrast * 2.0);
+
+    // Filter convolution: e + (b + d + f + h - 4*e) * w
+    half3 sharp = e + (b + d + f + h - 4.0 * e) * w;
+
+    return float4(saturate(sharp), 1.0);
+}

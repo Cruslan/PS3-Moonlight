@@ -319,10 +319,16 @@ int PltCreateThread(const char* name, ThreadEntry entry, void* context, PLT_THRE
         // recv → decrypt → RTP queue → FEC (Reed-Solomon) → depacketize → video callbacks.
         // 64KB (0x10000) overflows; 256KB (0x40000) provides sufficient headroom.
         
-        // Increase priority for network-critical threads
+        // Increase priority for network-critical threads on PS3 LV2.
+        // In PS3 LV2, priority values follow strict priority scheduling where
+        // smaller number = HIGHER priority (0: highest kernel/interrupt, 3071: lowest).
+        // 64 is the maximum safe real-time priority in user-space, strictly preempting
+        // audio playback (100), input polling (200), UI (500), and decoding (600).
         int priority = 1001; // Default
         if (name && (strcmp(name, "VideoRecv") == 0)) {
-            priority = 100; // Ultra-high priority for networking
+            priority = 64;  // Maximum safe priority for UDP video socket drainer
+        } else if (name && (strcmp(name, "AudioRecv") == 0)) {
+            priority = 90;  // High priority for audio reception
         } else if (name && (strcmp(name, "VideoDec") == 0)) {
             priority = 600; // High priority for decoding
         } else if (name && (strcmp(name, "VideoPing") == 0)) {

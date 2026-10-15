@@ -23,6 +23,11 @@
 #include "uuid.h"
 #include "net_logger.h"
 #include "handshake.h"
+/* Native PPU PolarSSL SHA-256 for pairing and certificate fingerprint verification.
+ * Runs during initial handshake on PPE in microseconds without holding an SPE core. */
+static inline void handshake_sha256(const unsigned char *in, size_t len, unsigned char out[32]) {
+    sha256(in, len, out, 0);
+}
 #include "ui.h"
 #include "random.h"
 #include <net/poll.h>
@@ -145,7 +150,7 @@ static int uuid_string_valid(const char *value) {
 static int certificate_fingerprint(const x509_crt *certificate,
                                    unsigned char output[32]) {
     if (!certificate || !certificate->raw.p || certificate->raw.len == 0) return -1;
-    sha256(certificate->raw.p, certificate->raw.len, output, 0);
+    handshake_sha256(certificate->raw.p, certificate->raw.len, output);
     return 0;
 }
 
@@ -843,7 +848,7 @@ int hv_pair(handshake_info_t *info, const char *pin) {
         memcpy(salt_pin, salt_data, 16);
         memcpy(salt_pin + 16, pin, 4);
         unsigned char hash[32];
-        sha256(salt_pin, 20, hash, 0);
+        handshake_sha256(salt_pin, 20, hash);
         memcpy(aes_key, hash, 16);
     }
 
@@ -958,7 +963,7 @@ int hv_pair(handshake_info_t *info, const char *pin) {
         memcpy(challenge_response + cr_len, client_secret_data, 16); cr_len += 16;
 
         unsigned char cr_hash[32];
-        sha256(challenge_response, cr_len, cr_hash, 0);
+        handshake_sha256(challenge_response, cr_len, cr_hash);
 
         unsigned char cr_hash_enc[32];
         {
@@ -1011,7 +1016,7 @@ int hv_pair(handshake_info_t *info, const char *pin) {
         // Actually vita verifies: data=pairing_secret[:16], sig=pairing_secret[16:272], cert=plaincert
         // pk_verify expects the HASH of the data, not the data itself
         unsigned char ps_hash[32];
-        sha256(pairing_secret, 16, ps_hash, 0);
+        handshake_sha256(pairing_secret, 16, ps_hash);
         int verify_rc = pk_verify(&server_cert.pk, POLARSSL_MD_SHA256,
                                   ps_hash, 32,
                                   pairing_secret + 16, pslen - 16);
@@ -1023,7 +1028,7 @@ int hv_pair(handshake_info_t *info, const char *pin) {
 
         // Sign client_secret_data with our private key
         unsigned char cs_hash[32];
-        sha256(client_secret_data, 16, cs_hash, 0);
+        handshake_sha256(client_secret_data, 16, cs_hash);
         unsigned char client_sig[256];
         size_t client_sig_len = 0;
         if (pk_sign(&key, POLARSSL_MD_SHA256, cs_hash, 32,
@@ -1222,13 +1227,18 @@ static int build_launch_params(char *path, size_t pathsz,
     char uuid_str[40];
     if (generate_uuid_string(uuid_str) != 0) return -1;
 
+    int stream_w = ui_get_stream_width();
+    int stream_h = ui_get_stream_height();
+    int fps = ui_get_fps();
+
     int length = snprintf(path, pathsz,
-        "/%s?uniqueid=%s&uuid=%s&appid=%d&mode=1280x720x60"
+        "/%s?uniqueid=%s&uuid=%s&appid=%d&mode=%dx%dx%d"
         "&additionalStates=1&sops=1"
         "&rikey=%s&rikeyid=%d"
         "&localAudioPlayMode=0&surroundAudioInfo=196610"
         "&remoteControllersBitmap=1&gcmap=1&corever=1",
-        verb, info->unique_id, uuid_str, app_id, rikey, rikeyid);
+        verb, info->unique_id, uuid_str, app_id, stream_w, stream_h, fps,
+        rikey, rikeyid);
     return length >= 0 && (size_t)length < pathsz ? 0 : -1;
 }
 

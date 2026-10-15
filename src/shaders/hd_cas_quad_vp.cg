@@ -1,0 +1,23 @@
+// Fullscreen Quad Vertex Shader for HD Modes (1080p / 720p) on PS3 RSX (vp40 profile)
+// Directly transforms Normalized Device Coordinates (NDC) to RSX clip space.
+// Passes primary UV (TEXCOORD0) and dynamic texel step / offset (TEXCOORD1).
+
+struct vIn {
+    float2 pos : POSITION;
+    float2 uv  : TEXCOORD0;
+    float2 ts  : TEXCOORD1;
+};
+
+struct vOut {
+    float4 pos : POSITION;
+    float2 uv  : TEXCOORD0;
+    float2 ts  : TEXCOORD1;
+};
+
+vOut main(vIn IN) {
+    vOut OUT;
+    OUT.pos = float4(IN.pos.x, IN.pos.y, 0.0, 1.0);
+    OUT.uv = IN.uv;
+    OUT.ts = IN.ts;
+    return OUT;
+}

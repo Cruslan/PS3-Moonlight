@@ -30,6 +30,70 @@ SYS_PROCESS_PARAM(1001, 0x100000)
 // PS3 watchdog'u besleme - şimdilik devre dışı (crash yapıyor olabilir)
 // static void pump_sysutil() { sysUtilCheckCallback(); }
 
+/* PSL1GHT libnet gatekeeper: every socket call checks LIBNET_INITIALZED (__netMemory != NULL).
+ * When using a custom high-throughput network pool via netInitializeNetworkEx, we MUST set __netMemory,
+ * otherwise socket(), connect(), send(), etc. will fail immediately with errno = ENOSYS (88). */
+extern void *__netMemory;
+
+/* Dedicated high-throughput sys_net memory pool to prevent mbuf starvation and Lv-2 kernel DSI */
+static void *g_net_memory_pool = NULL;
+
+static int ps3_net_init(void) {
+  sysModuleLoad(SYSMODULE_NET);
+
+  /* Allocate a dedicated 4MB / 2MB memory pool for the PS3 kernel network subsystem.
+   * PSL1GHT's default netInitialize() only allocates 128 KB (0x20000). Moonlight's
+   * video (64KB) and audio (64KB) UDP socket receive buffers consume the entire 128KB,
+   * leading to kernel mbuf pool exhaustion (ENOBUFS) and Lv-2 Data Storage Interrupt
+   * crashes (DAR=0x18 null pointer dereference) under continuous streaming. */
+  static const uint32_t pool_sizes[] = {
+    4 * 1024 * 1024,  /* 4 MB (32x default) */
+    2 * 1024 * 1024,  /* 2 MB (16x default) */
+    1024 * 1024,      /* 1 MB (8x default) */
+    512 * 1024        /* 512 KB (4x default) */
+  };
+
+  for (size_t i = 0; i < sizeof(pool_sizes) / sizeof(pool_sizes[0]); i++) {
+    uint32_t sz = pool_sizes[i];
+    g_net_memory_pool = memalign(4096, sz);
+    if (!g_net_memory_pool) continue;
+
+    netInitParam param;
+    memset(&param, 0, sizeof(param));
+    param.memory = (u32)(uintptr_t)g_net_memory_pool;
+    param.memory_size = sz;
+    param.flags = 0;
+
+    int ret = netInitializeNetworkEx(&param);
+    if (ret == 0) {
+      __netMemory = g_net_memory_pool;
+      netCtlInit();
+      return 0;
+    }
+
+    free(g_net_memory_pool);
+    g_net_memory_pool = NULL;
+  }
+
+  // Fallback to standard 128KB default if custom sizes fail
+  int ret = netInitialize();
+  netCtlInit();
+  return ret;
+}
+
+static void ps3_net_shutdown(void) {
+  netCtlTerm();
+  if (g_net_memory_pool) {
+    __netMemory = NULL;
+    netFinalizeNetwork();
+    free(g_net_memory_pool);
+    g_net_memory_pool = NULL;
+  } else {
+    netDeinitialize();
+  }
+  sysModuleUnload(SYSMODULE_NET);
+}
+
 static void sysutil_exit_callback(u64 status, u64 param, void *usrdata) {
   (void)param;
   (void)usrdata;
@@ -43,10 +107,15 @@ static void sysutil_exit_callback(u64 status, u64 param, void *usrdata) {
 int main(int argc, char **argv) {
   (void)argc;
   (void)argv;
-  // Ağı başlat
-  sysModuleLoad(SYSMODULE_NET);
-  netInitialize();
-  netCtlInit();
+
+  /* Enable Hardware Flush-to-Zero (Non-IEEE mode) on Cell PPE.
+   * Bit 29 of FPSCR is NI (Non-IEEE mode bit). Setting it forces subnormal
+   * float operands/results to zero in 1 cycle, preventing high-latency microcode
+   * assist interrupt traps during quiet audio, fading sound, or floating-point stats. */
+  __asm__ volatile("mtfsb1 29" ::: "memory");
+
+  // Ağı başlat (Genişletilmiş yüksek verimli bellek havuzu ile)
+  ps3_net_init();
 
   // Register sysutil callback to handle game exit
   sysUtilRegisterCallback(0, sysutil_exit_callback, NULL);
@@ -54,6 +123,7 @@ int main(int argc, char **argv) {
   // Logger başlat
   net_logger_init();
   ps3perf_init();
+
 
   // Çözünürlük Tespiti
   videoState vstate;
@@ -70,9 +140,18 @@ int main(int argc, char **argv) {
     height = 720;
   }
 
-  NLOG("Detected Resolution: %dx%d", width, height);
+  int is_4_3 = 0;
+  if (vstate.displayMode.aspect == VIDEO_ASPECT_4_3) {
+    is_4_3 = 1;
+  } else if (vstate.displayMode.aspect == VIDEO_ASPECT_16_9) {
+    is_4_3 = 0;
+  } else if (height > 0 && ((float)width / (float)height) < 1.5f) {
+    is_4_3 = 1;
+  }
 
-  ui_init(width, height);
+  NLOG("Detected Display: %dx%d (%s)", width, height, is_4_3 ? "4:3 Standard/CRT" : "16:9 Widescreen");
+
+  ui_init(width, height, is_4_3);
   ps3input_start();
   NLOG("Moonlight PS3 UI Initialized");
   
@@ -192,14 +271,25 @@ int main(int argc, char **argv) {
       // Setup Stream
       STREAM_CONFIGURATION streamConfig;
       LiInitializeStreamConfiguration(&streamConfig);
-      streamConfig.width = 1280;
-      streamConfig.height = 720;
+      streamConfig.width = ui_get_stream_width();
+      streamConfig.height = ui_get_stream_height();
       streamConfig.fps = ui_get_fps(); // Dynamic FPS from UI selection
       streamConfig.bitrate = ui_get_bitrate(); // Dynamic bitrate from UI selection
       streamConfig.packetSize = 1024; // Smaller packets reduce PS3 kernel mbuf pressure
       streamConfig.streamingRemotely = STREAM_CFG_LOCAL;
       streamConfig.audioConfiguration = AUDIO_CONFIGURATION_STEREO;
       streamConfig.supportedVideoFormats = VIDEO_FORMAT_H264;
+
+      /* Protocol-level frame pacing: Notify Sunshine / GFE of PS3 hardware refresh rate.
+       * PS3 NTSC displays operate at 59.94 Hz (5994). When notified, modern host capture
+       * pipelines pace frames at exactly 59.940 Hz instead of 60.000 Hz, eliminating
+       * the 1-frame-every-16.7s clock drift right at the source. */
+      if (vres.height == 576) {
+        streamConfig.clientRefreshRateX100 = 5000; // 50.00 Hz PAL standard
+      } else {
+        streamConfig.clientRefreshRateX100 = 5994; // 59.94 Hz NTSC standard
+      }
+
       memcpy(streamConfig.remoteInputAesKey, rikey_bin, 16);
 
       connection_callbacks_init();
@@ -275,8 +365,6 @@ int main(int argc, char **argv) {
   net_logger_shutdown();
   sysUtilUnregisterCallback(0);
   usleep(100000); // 100ms graceful drain for final network sockets
-  netCtlTerm();
-  netDeinitialize();
-  sysModuleUnload(SYSMODULE_NET);
+  ps3_net_shutdown();
   return 0;
 }

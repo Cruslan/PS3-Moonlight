@@ -1,4 +1,5 @@
-# PS3 Toolchain (installed via make prepare)
+# PS3 Toolchain (installed via make prepare or symlinked for local dev)
+ps3dev
 ps3dev/
 ps3dev-*.tar.gz
 ps3dev-*.tar.gz.tmp
@@ -25,3 +26,9 @@ third_party/**/*.a
 .DS_Store
 *.swp
 *~
+__pycache__/
+*.pyc
+ps3perf.data
+ps3perf_host
+.trash/
+

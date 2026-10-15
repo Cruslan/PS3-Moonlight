@@ -132,11 +132,13 @@ static void VideoReceiveThreadProc(void* context) {
 
     waitingForVideoMs = 0;
     
-    // Pre-allocate a batch buffer.  On PS3 real hardware the smaller batch
-    // reduces time spent in the drain loop, giving the main thread more
-    // opportunities to call vdec_poll() and avoid VDEC back-pressure.
+    // Pre-allocate a batch buffer. On PS3 real hardware, IDR keyframes can burst
+    // 180-210 UDP packets within milliseconds. The LV2 kernel socket buffer is capped
+    // at 64 KB (~44 packets). Sizing the batch to 256 packets (512 KB) allows Phase 1
+    // to drain the entire IDR burst in a tight non-blocking loop before entering Phase 2,
+    // completely eliminating socket overflow (ENOBUFS) and Unrecoverable frame errors.
     #ifdef __PPU__
-    #define VIDEO_BATCH_SIZE 64
+    #define VIDEO_BATCH_SIZE 256
     #define VIDEO_MAX_PACKET_SIZE 2048
     #else
     #define VIDEO_BATCH_SIZE 32

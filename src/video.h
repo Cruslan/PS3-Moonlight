@@ -12,6 +12,8 @@ int  ps3video_is_active();
 void ps3video_draw();
 int  ps3video_get_current_fps();
 int  ps3video_get_decoded_fps();
+int  ps3video_get_submitted_fps();
+int  ps3video_get_dropped_fps();
 int  ps3video_get_decode_latency();
 int  ps3video_get_render_latency();
 int  ps3video_get_net_latency();

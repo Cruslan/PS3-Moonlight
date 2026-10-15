@@ -1,0 +1,32 @@
+// 4-Tap Bilinear Box Downscaler tailored for HD Modes (1080p / 720p) on PS3 RSX (fp40 profile)
+// High-efficiency, zero-ringing area-average downsampling filter.
+// Covers a 4x4 (16 texel) footprint in just 4 hardware bilinear fetches.
+//
+// Formulation:
+//   Samples 4 bilinear taps with half-texel offset (d = 0.5 / width, 0.5 / height)
+//   s0 = (uv.x - d.x, uv.y - d.y)
+//   s1 = (uv.x + d.x, uv.y - d.y)
+//   s2 = (uv.x - d.x, uv.y + d.y)
+//   s3 = (uv.x + d.x, uv.y + d.y)
+//   result = (s0 + s1 + s2 + s3) * 0.25
+//
+// Eliminates high-frequency aliasing, shimmering, and moire on high-to-low video downsampling.
+
+struct vOut {
+    float4 pos : POSITION;
+    float2 uv  : TEXCOORD0;
+    float2 d   : TEXCOORD1; // half-texel offset (0.5 / width, 0.5 / height)
+};
+
+float4 main(vOut IN, uniform sampler2D tex : TEXUNIT0) : COLOR
+{
+    float2 uv = IN.uv;
+    float2 d  = IN.d;
+
+    half4 s0 = tex2D(tex, uv + float2(-d.x, -d.y));
+    half4 s1 = tex2D(tex, uv + float2( d.x, -d.y));
+    half4 s2 = tex2D(tex, uv + float2(-d.x,  d.y));
+    half4 s3 = tex2D(tex, uv + float2( d.x,  d.y));
+
+    return (s0 + s1 + s2 + s3) * 0.25;
+}

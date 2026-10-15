@@ -66,7 +66,10 @@ void initializeVideoDepacketizer(int pktSize) {
     // provides ~2 seconds of buffer at 60fps.  On other platforms a small
     // queue is fine because software decoders are consistently fast.
 #ifdef __PPU__
-    LbqInitializeLinkedBlockingQueue(&decodeUnitQueue, 120);
+    // Keep decode unit queue shallow (4 frames ~66ms) to prevent buffer bloat and input lag buildup.
+    // Real-time game streaming requires immediate presentation; accumulating seconds of backlog
+    // causes catastrophic clock drift and periodic queue overflow drops.
+    LbqInitializeLinkedBlockingQueue(&decodeUnitQueue, 4);
 #else
     LbqInitializeLinkedBlockingQueue(&decodeUnitQueue, 15);
 #endif
