@@ -1,9 +1,12 @@
 #include "input.h"
+#include "connection.h"
+#include "net_logger.h"
 #include "ui.h"
 #include <Limelight.h>
 #include <io/pad.h>
 #include <io/mouse.h>
 #include <io/kb.h>
+#include <stdbool.h>
 #include <string.h>
 #include <sys/mutex.h>
 #include <sys/thread.h>
@@ -15,6 +18,7 @@ static sys_ppu_thread_t input_thread;
 static ps3_pad_state_t g_pad_state = {0};
 static sys_mutex_t pad_state_mutex;
 static int pad_state_mutex_initialized = 0;
+static volatile int g_connected_pad_mask = 1;
 
 // Mouse state tracking
 static u8 last_mouse_buttons[MAX_MICE] = {0};
@@ -182,6 +186,20 @@ static uint16_t ps3_translate_keycode_to_vk(u16 code) {
     return 0;
 }
 
+int ps3input_get_connected_mask(void) {
+    int mask = g_connected_pad_mask;
+    return (mask > 0) ? mask : 1;
+}
+
+void ps3input_set_rumble(unsigned short controller_num, unsigned short low_freq_motor, unsigned short high_freq_motor) {
+    if (controller_num >= PS3_MAX_CONTROLLERS) return;
+    padActParam actparam;
+    memset(&actparam, 0, sizeof(actparam));
+    actparam.small_motor = (high_freq_motor > 0) ? 1 : 0;
+    actparam.large_motor = (u8)(low_freq_motor >> 8);
+    ioPadSetActDirect((u32)controller_num, &actparam);
+}
+
 void ps3input_get_data(ps3_pad_state_t *state) {
     if (!state) return;
     if (!pad_state_mutex_initialized) {
@@ -199,7 +217,14 @@ static void input_loop(void *arg) {
     (void)arg;
     padInfo padinfo;
     padData paddata;
-    int last_buttons = 0;
+    int last_buttons[PS3_MAX_CONTROLLERS] = {0};
+    int cur_buttons[PS3_MAX_CONTROLLERS] = {0};
+    short cur_lx[PS3_MAX_CONTROLLERS] = {0};
+    short cur_ly[PS3_MAX_CONTROLLERS] = {0};
+    short cur_rx[PS3_MAX_CONTROLLERS] = {0};
+    short cur_ry[PS3_MAX_CONTROLLERS] = {0};
+    uint8_t pad_was_connected[PS3_MAX_CONTROLLERS] = {0};
+    uint8_t pad_announced[PS3_MAX_CONTROLLERS] = {0};
 
     int buttonFlags = 0;
     short leftStickX = 0;
@@ -215,10 +240,45 @@ static void input_loop(void *arg) {
     ioMouseInit(7);
 
     while(active_input_thread) {
-        // 1. Controller Polling
+        // 1. Multi-Controller Polling (Local Co-Op Support for up to PS3_MAX_CONTROLLERS pads)
         ioPadGetInfo(&padinfo);
-        for(int i = 0; i < 1; i++) { // Polling primary controller (index 0)
-            if(padinfo.status[i]) {
+
+        bool stream_connected = connection_is_connected();
+        if (!stream_connected) {
+            memset(pad_announced, 0, sizeof(pad_announced));
+        }
+
+        // Compute activeGamepadMask across all connected controllers first
+        short activeGamepadMask = 0;
+        for (int i = 0; i < PS3_MAX_CONTROLLERS; i++) {
+            if (padinfo.status[i]) {
+                activeGamepadMask |= (short)(1 << i);
+            }
+        }
+        g_connected_pad_mask = (activeGamepadMask != 0) ? (int)activeGamepadMask : 1;
+
+        int newly_pressed_combined = 0;
+
+        for (int i = 0; i < PS3_MAX_CONTROLLERS; i++) {
+            if (padinfo.status[i]) {
+                pad_was_connected[i] = 1;
+
+                // Announce controller arrival to Sunshine when stream connects or controller is hotplugged
+                if (stream_connected && !pad_announced[i]) {
+                    uint32_t supportedButtons = A_FLAG | B_FLAG | X_FLAG | Y_FLAG |
+                                                UP_FLAG | DOWN_FLAG | LEFT_FLAG | RIGHT_FLAG |
+                                                LB_FLAG | RB_FLAG | PLAY_FLAG | BACK_FLAG |
+                                                LS_CLK_FLAG | RS_CLK_FLAG | SPECIAL_FLAG;
+                    uint16_t capabilities = LI_CCAP_ANALOG_TRIGGERS | LI_CCAP_RUMBLE;
+                    LiSendControllerArrivalEvent((uint8_t)i, (uint16_t)activeGamepadMask,
+                                                 LI_CTYPE_PS, supportedButtons, capabilities);
+                    // Send an initial neutral state packet so Sunshine creates the virtual pad immediately
+                    LiSendMultiControllerEvent((short)i, activeGamepadMask,
+                                               0, 0, 0, 0, 0, 0, 0);
+                    pad_announced[i] = 1;
+                    NLOG("Input: Controller %d connected and announced (mask=0x%02X)", i, activeGamepadMask);
+                }
+
                 ioPadGetData(i, &paddata);
 
                 if (paddata.len > 0) {
@@ -261,31 +321,64 @@ static void input_loop(void *arg) {
                     leftTrigger = paddata.BTN_L2 ? 0xFF : 0x00;
                     rightTrigger = paddata.BTN_R2 ? 0xFF : 0x00;
 
-                    // Send controller event to Moonlight/Sunshine server
-                    LiSendControllerEvent(buttonFlags, leftTrigger, rightTrigger, leftStickX, leftStickY, rightStickX, rightStickY);
+                    // Send multi-controller event to Moonlight/Sunshine server
+                    if (stream_connected) {
+                        LiSendMultiControllerEvent((short)i, activeGamepadMask,
+                                                   buttonFlags, leftTrigger, rightTrigger,
+                                                   leftStickX, leftStickY, rightStickX, rightStickY);
+                    }
 
-                    // Update shared state for UI
-                    sysMutexLock(pad_state_mutex, 0);
-                    g_pad_state.buttons_down = buttonFlags;
-                    g_pad_state.buttons_pressed |= (buttonFlags & ~last_buttons);
-                    g_pad_state.lx = leftStickX;
-                    g_pad_state.ly = leftStickY;
-                    g_pad_state.rx = rightStickX;
-                    g_pad_state.ry = rightStickY;
-                    sysMutexUnlock(pad_state_mutex);
+                    newly_pressed_combined |= (buttonFlags & ~last_buttons[i]);
+                    last_buttons[i] = buttonFlags;
+                    cur_buttons[i] = buttonFlags;
+                    cur_lx[i] = leftStickX;
+                    cur_ly[i] = leftStickY;
+                    cur_rx[i] = rightStickX;
+                    cur_ry[i] = rightStickY;
+                }
+            } else if (pad_was_connected[i]) {
+                // Controller i disconnected: notify Sunshine by sending empty event with bit i cleared in activeGamepadMask
+                if (stream_connected) {
+                    LiSendMultiControllerEvent((short)i, activeGamepadMask,
+                                               0, 0, 0, 0, 0, 0, 0);
+                    NLOG("Input: Controller %d disconnected (mask=0x%02X)", i, activeGamepadMask);
+                }
+                pad_was_connected[i] = 0;
+                pad_announced[i] = 0;
+                last_buttons[i] = 0;
+                cur_buttons[i] = 0;
+                cur_lx[i] = 0;
+                cur_ly[i] = 0;
+                cur_rx[i] = 0;
+                cur_ry[i] = 0;
+            }
+        }
 
-                    last_buttons = buttonFlags;
+        // Aggregate state across connected controllers for local UI and emergency exit combo
+        int combined_down = 0;
+        short ui_lx = 0, ui_ly = 0, ui_rx = 0, ui_ry = 0;
+        for (int i = 0; i < PS3_MAX_CONTROLLERS; i++) {
+            if (padinfo.status[i]) {
+                combined_down |= cur_buttons[i];
+                if (ui_lx == 0 && ui_ly == 0 && (cur_lx[i] != 0 || cur_ly[i] != 0)) {
+                    ui_lx = cur_lx[i];
+                    ui_ly = cur_ly[i];
+                }
+                if (ui_rx == 0 && ui_ry == 0 && (cur_rx[i] != 0 || cur_ry[i] != 0)) {
+                    ui_rx = cur_rx[i];
+                    ui_ry = cur_ry[i];
                 }
             }
         }
 
-        if (!padinfo.status[0] && last_buttons != 0) {
-            LiSendControllerEvent(0, 0, 0, 0, 0, 0, 0);
             sysMutexLock(pad_state_mutex, 0);
-            memset(&g_pad_state, 0, sizeof(g_pad_state));
+        g_pad_state.buttons_down = combined_down;
+        g_pad_state.buttons_pressed |= newly_pressed_combined;
+        g_pad_state.lx = ui_lx;
+        g_pad_state.ly = ui_ly;
+        g_pad_state.rx = ui_rx;
+        g_pad_state.ry = ui_ry;
             sysMutexUnlock(pad_state_mutex);
-            last_buttons = 0;
-        }
 
         // 2. Mouse Polling (USB / Bluetooth HID Mice)
         mouseInfo minfo;

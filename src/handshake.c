@@ -29,6 +29,7 @@ static inline void handshake_sha256(const unsigned char *in, size_t len, unsigne
     sha256(in, len, out, 0);
 }
 #include "ui.h"
+#include "input.h"
 #include "random.h"
 #include <net/poll.h>
 
@@ -1231,14 +1232,17 @@ static int build_launch_params(char *path, size_t pathsz,
     int stream_h = ui_get_stream_height();
     int fps = ui_get_fps();
 
+    int pad_mask = ps3input_get_connected_mask();
+    if (pad_mask <= 0) pad_mask = 1;
+
     int length = snprintf(path, pathsz,
         "/%s?uniqueid=%s&uuid=%s&appid=%d&mode=%dx%dx%d"
         "&additionalStates=1&sops=1"
         "&rikey=%s&rikeyid=%d"
         "&localAudioPlayMode=0&surroundAudioInfo=196610"
-        "&remoteControllersBitmap=1&gcmap=1&corever=1",
+        "&remoteControllersBitmap=%d&gcmap=%d&corever=1",
         verb, info->unique_id, uuid_str, app_id, stream_w, stream_h, fps,
-        rikey, rikeyid);
+        rikey, rikeyid, pad_mask, pad_mask);
     return length >= 0 && (size_t)length < pathsz ? 0 : -1;
 }
 
