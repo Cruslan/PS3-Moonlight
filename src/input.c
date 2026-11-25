@@ -226,9 +226,10 @@ static void input_loop(void *arg) {
                     
                     if (paddata.BTN_CROSS) buttonFlags |= A_FLAG;
                     if (paddata.BTN_CIRCLE) buttonFlags |= B_FLAG;
-                    // Swap Square and Triangle mappings to match user's physical-to-virtual layout
-                    if (paddata.BTN_SQUARE) buttonFlags |= Y_FLAG;
-                    if (paddata.BTN_TRIANGLE) buttonFlags |= X_FLAG;
+                    // Optionally swap Square and Triangle mappings to match user's physical-to-virtual layout
+                    int swap_sq_tri = ui_get_swap_square_triangle();
+                    if (paddata.BTN_SQUARE) buttonFlags |= swap_sq_tri ? Y_FLAG : X_FLAG;
+                    if (paddata.BTN_TRIANGLE) buttonFlags |= swap_sq_tri ? X_FLAG : Y_FLAG;
                     
                     if (paddata.BTN_UP) buttonFlags |= UP_FLAG;
                     if (paddata.BTN_DOWN) buttonFlags |= DOWN_FLAG;

@@ -66,8 +66,8 @@ static int ui_vsync = 1; // Default: VSync ON (1)
 #define MAIN_MENU_ITEM_COUNT 3
 static int active_main_item = 0; // 0: Sunshine Host IP, 1: Configure Settings, 2: Connect/Pair
 
-#define SETTINGS_ITEM_COUNT 9
-static int active_settings_item = 0; // 0: FPS, 1: Bitrate, 2: Stream Res, 3: Scaling Engine, 4: Mouse, 5: VSync, 6: Stats, 7: Verbose, 8: Back
+#define SETTINGS_ITEM_COUNT 10
+static int active_settings_item = 0; // 0: FPS, 1: Bitrate, 2: Stream Res, 3: Scaling Engine, 4: Mouse, 5: VSync, 6: Stats, 7: Verbose, 8: Swap Square/Triangle, 9: Back
 
 static int frames_drawn_this_sec = 0;
 static int ui_fps_actual = 0;
@@ -75,6 +75,7 @@ static u64 last_ui_time = 0;
 static int show_stats = 0; // Default: Stats OFF (0)
 static int ui_verbose = 0; // Default: Verbose Logging OFF (0)
 static int ui_mouse_mode = 0; // Default: 0 = Game Mode (Relative), 1 = Desktop Mode (Absolute)
+static int ui_swap_square_triangle = 1; // Default: Swap Square/Triangle ON (1)
 
 // Aspect ratio & stream resolution states
 static int ui_display_is_4_3 = 0; // Automatically detected from PS3 display mode
@@ -104,6 +105,7 @@ int ui_get_vsync() { return ui_vsync; }
 int ui_get_show_stats() { return show_stats; }
 int ui_get_verbose() { return ui_verbose; }
 int ui_get_mouse_mode(void) { return ui_mouse_mode; }
+int ui_get_swap_square_triangle(void) { return ui_swap_square_triangle; }
 int ui_get_upscaler_mode(void) { return (ui_scaling_mode == SCALING_MODE_SHADER) ? 1 : 0; }
 void ui_set_upscaler_mode(int mode) { ui_scaling_mode = mode ? SCALING_MODE_SHADER : SCALING_MODE_LEGACY; }
 
@@ -276,6 +278,7 @@ void ui_save_settings(void) {
         fprintf(f, "fps=%d\n", ui_fps);
         fprintf(f, "bitrate_idx=%d\n", ui_bitrate_idx);
         fprintf(f, "mouse_mode=%d\n", ui_mouse_mode);
+        fprintf(f, "swap_square_triangle=%d\n", ui_swap_square_triangle ? 1 : 0);
         fprintf(f, "vsync=%d\n", ui_vsync ? 1 : 0);
         fprintf(f, "stats=%d\n", show_stats ? 1 : 0);
         fprintf(f, "verbose=%d\n", ui_verbose ? 1 : 0);
@@ -345,6 +348,8 @@ void ui_load_settings(void) {
             } else if (strcmp(key, "mouse_mode") == 0) {
                 int v = atoi(v_start);
                 if (v == 0 || v == 1) ui_mouse_mode = v;
+            } else if (strcmp(key, "swap_square_triangle") == 0) {
+                ui_swap_square_triangle = (atoi(v_start) != 0);
             } else if (strcmp(key, "vsync") == 0) {
                 ui_vsync = (atoi(v_start) != 0);
             } else if (strcmp(key, "stats") == 0) {
@@ -1108,6 +1113,16 @@ static void ui_loop(void *arg) {
                     if (ui_verbose != 1) { ui_verbose = 1; mark_settings_dirty(); }
                 }
             } else if (active_settings_item == 8) {
+                // Swap Square/Triangle toggle
+                if (pad.buttons_pressed & A_FLAG) {
+                    ui_swap_square_triangle = !ui_swap_square_triangle;
+                    mark_settings_dirty();
+                } else if (pad.buttons_pressed & LEFT_FLAG) {
+                    if (ui_swap_square_triangle != 0) { ui_swap_square_triangle = 0; mark_settings_dirty(); }
+                } else if (pad.buttons_pressed & RIGHT_FLAG) {
+                    if (ui_swap_square_triangle != 1) { ui_swap_square_triangle = 1; mark_settings_dirty(); }
+                }
+            } else if (active_settings_item == 9) {
                 // Back to Main Menu
                 if (pad.buttons_pressed & A_FLAG) {
                     ui_flush_settings_if_dirty();
@@ -1346,10 +1361,16 @@ static void ui_loop(void *arg) {
                 SetFontColor((active_settings_item == 7) ? 0xff82b1ff : 0xffffffff, 0);
                 DrawFormatString(SX(430), SY(302), "[ %s ]", ui_verbose ? "ON" : "OFF");
 
-                // Row 8: Back to Main Menu Button
-                SetFontSize(SF(21), SF(21));
+                // Row 8: Swap Square/Triangle
+                SetFontColor((active_settings_item == 8) ? 0xff82b1ff : 0xffb0bec5, 0);
+                DrawString(SX(60), SY(332), "Swap \x04 / \x03 Buttons:");
                 SetFontColor((active_settings_item == 8) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawString(SX(60), SY(345), "[ BACK TO MAIN MENU ]");
+                DrawFormatString(SX(430), SY(332), "[ %s ]", ui_swap_square_triangle ? "ON" : "OFF");
+
+                // Row 9: Back to Main Menu Button
+                SetFontSize(SF(21), SF(21));
+                SetFontColor((active_settings_item == 9) ? 0xff82b1ff : 0xffffffff, 0);
+                DrawString(SX(60), SY(375), "[ BACK TO MAIN MENU ]");
 
                 // Clean controls legend
                 SetFontSize(SF(18), SF(18));

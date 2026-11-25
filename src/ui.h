@@ -32,6 +32,7 @@ int ui_get_vsync();
 int ui_get_show_stats();
 int ui_get_verbose();
 int ui_get_mouse_mode(void);
+int ui_get_swap_square_triangle(void);
 int ui_get_upscaler_mode(void);
 void ui_set_upscaler_mode(int mode);
 void ui_save_settings(void);
