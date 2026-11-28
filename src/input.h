@@ -12,5 +12,6 @@ typedef struct {
 void ps3input_start();
 void ps3input_stop();
 void ps3input_get_data(ps3_pad_state_t *state);
+void ps3input_set_rumble(int port, unsigned short low_freq, unsigned short high_freq);
 
 #endif

@@ -1,5 +1,7 @@
 #include "input.h"
 #include "ui.h"
+#include "connection.h"
+#include "net_logger.h"
 #include <Limelight.h>
 #include <io/pad.h>
 #include <io/mouse.h>
@@ -9,10 +11,30 @@
 #include <sys/thread.h>
 #include <unistd.h>
 
+#define PS3_MAX_CONTROLLERS MAX_PORT_NUM
+#define PS3_SUPPORTED_BUTTON_FLAGS ( \
+    A_FLAG | B_FLAG | X_FLAG | Y_FLAG | \
+    UP_FLAG | DOWN_FLAG | LEFT_FLAG | RIGHT_FLAG | \
+    LB_FLAG | RB_FLAG | PLAY_FLAG | BACK_FLAG | \
+    LS_CLK_FLAG | RS_CLK_FLAG)
+
+typedef struct {
+    int buttons;
+    short lx, ly, rx, ry;
+    unsigned char lt, rt;
+} ps3_port_cache_t;
+
+typedef struct {
+    u8 small_motor;
+    u8 large_motor;
+    int dirty;
+} ps3_rumble_state_t;
+
 static volatile int active_input_thread = 0;
 static int input_thread_started = 0;
 static sys_ppu_thread_t input_thread;
 static ps3_pad_state_t g_pad_state = {0};
+static ps3_rumble_state_t g_rumble_pending[PS3_MAX_CONTROLLERS] = {{0}};
 static sys_mutex_t pad_state_mutex;
 static int pad_state_mutex_initialized = 0;
 
@@ -195,96 +217,186 @@ void ps3input_get_data(ps3_pad_state_t *state) {
     sysMutexUnlock(pad_state_mutex);
 }
 
+/** Queue rumble motor speeds safely from the Moonlight callback thread for InputThread execution. */
+void ps3input_set_rumble(int port, unsigned short low_freq, unsigned short high_freq) {
+    if (port < 0 || port >= PS3_MAX_CONTROLLERS || !pad_state_mutex_initialized) return;
+
+    sysMutexLock(pad_state_mutex, 0);
+    g_rumble_pending[port].large_motor = (u8)(low_freq >> 8);
+    g_rumble_pending[port].small_motor = ((high_freq >> 8) > 0) ? 1 : 0;
+    g_rumble_pending[port].dirty = 1;
+    sysMutexUnlock(pad_state_mutex);
+}
+
+static inline short clamp_s16(int v) {
+    return (short)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v));
+}
+
+/** Decode PSL1GHT padData bitfields and axes into Moonlight controller state. */
+static void decode_pad_data(const padData *paddata, ps3_port_cache_t *out) {
+    int buttonFlags = 0;
+
+    if (paddata->BTN_CROSS) buttonFlags |= A_FLAG;
+    if (paddata->BTN_CIRCLE) buttonFlags |= B_FLAG;
+    // Map face buttons by physical position (Cross->A, Circle->B, Square->X, Triangle->Y)
+    if (paddata->BTN_SQUARE) buttonFlags |= X_FLAG;
+    if (paddata->BTN_TRIANGLE) buttonFlags |= Y_FLAG;
+
+    if (paddata->BTN_UP) buttonFlags |= UP_FLAG;
+    if (paddata->BTN_DOWN) buttonFlags |= DOWN_FLAG;
+    if (paddata->BTN_LEFT) buttonFlags |= LEFT_FLAG;
+    if (paddata->BTN_RIGHT) buttonFlags |= RIGHT_FLAG;
+
+    if (paddata->BTN_L1) buttonFlags |= LB_FLAG;
+    if (paddata->BTN_R1) buttonFlags |= RB_FLAG;
+
+    if (paddata->BTN_START) buttonFlags |= PLAY_FLAG;
+    if (paddata->BTN_SELECT) buttonFlags |= BACK_FLAG;
+
+    if (paddata->BTN_L3) buttonFlags |= LS_CLK_FLAG;
+    if (paddata->BTN_R3) buttonFlags |= RS_CLK_FLAG;
+
+    // PS3 analog Y ranges 0 (UP)..255 (DOWN); Moonlight expects UP positive and DOWN negative.
+    out->buttons = buttonFlags;
+    out->lx = clamp_s16((paddata->ANA_L_H - 128) * 256);
+    out->ly = clamp_s16((paddata->ANA_L_V - 128) * -256);
+    out->rx = clamp_s16((paddata->ANA_R_H - 128) * 256);
+    out->ry = clamp_s16((paddata->ANA_R_V - 128) * -256);
+    out->lt = paddata->BTN_L2 ? 0xFF : 0x00;
+    out->rt = paddata->BTN_R2 ? 0xFF : 0x00;
+}
+
 static void input_loop(void *arg) {
     (void)arg;
     padInfo padinfo;
     padData paddata;
-    int last_buttons = 0;
+    ps3_port_cache_t ports[PS3_MAX_CONTROLLERS];
+    int prev_buttons[PS3_MAX_CONTROLLERS] = {0};
+    u8 active_small[PS3_MAX_CONTROLLERS] = {0};
+    u8 active_large[PS3_MAX_CONTROLLERS] = {0};
+    uint16_t announced_mask = 0;
 
-    int buttonFlags = 0;
-    short leftStickX = 0;
-    short leftStickY = 0;
-    short rightStickX = 0;
-    short rightStickY = 0;
-    unsigned char leftTrigger = 0;
-    unsigned char rightTrigger = 0;
+    memset(ports, 0, sizeof(ports));
 
-    // Initialize all input device libraries
-    ioPadInit(7);
+    // Initialize all input device libraries (up to 7 PS3 controller ports)
+    ioPadInit(PS3_MAX_CONTROLLERS);
     ioKbInit(7);
     ioMouseInit(7);
 
     while(active_input_thread) {
-        // 1. Controller Polling
-        ioPadGetInfo(&padinfo);
-        for(int i = 0; i < 1; i++) { // Polling primary controller (index 0)
-            if(padinfo.status[i]) {
-                ioPadGetData(i, &paddata);
+        int stream_connected = connection_is_connected();
 
-                if (paddata.len > 0) {
-                    buttonFlags = 0;
-                    
-                    if (paddata.BTN_CROSS) buttonFlags |= A_FLAG;
-                    if (paddata.BTN_CIRCLE) buttonFlags |= B_FLAG;
-                    // Map face buttons by physical position (Cross->A, Circle->B, Square->X, Triangle->Y)
-                    if (paddata.BTN_SQUARE) buttonFlags |= X_FLAG;
-                    if (paddata.BTN_TRIANGLE) buttonFlags |= Y_FLAG;
-                    
-                    if (paddata.BTN_UP) buttonFlags |= UP_FLAG;
-                    if (paddata.BTN_DOWN) buttonFlags |= DOWN_FLAG;
-                    if (paddata.BTN_LEFT) buttonFlags |= LEFT_FLAG;
-                    if (paddata.BTN_RIGHT) buttonFlags |= RIGHT_FLAG;
-                    
-                    if (paddata.BTN_L1) buttonFlags |= LB_FLAG;
-                    if (paddata.BTN_R1) buttonFlags |= RB_FLAG;
-                    
-                    if (paddata.BTN_START) buttonFlags |= PLAY_FLAG;
-                    if (paddata.BTN_SELECT) buttonFlags |= BACK_FLAG;
-                    
-                    if (paddata.BTN_L3) buttonFlags |= LS_CLK_FLAG;
-                    if (paddata.BTN_R3) buttonFlags |= RS_CLK_FLAG;
+        // 1. Multi-Controller Polling (Ports 0..6)
+        memset(&padinfo, 0, sizeof(padinfo));
+        if (ioPadGetInfo(&padinfo) == 0) {
+            uint16_t active_mask = 0;
+            int updated[PS3_MAX_CONTROLLERS] = {0};
+            int combined_down = 0;
+            int combined_pressed = 0;
+            short ui_lx = 0, ui_ly = 0, ui_rx = 0, ui_ry = 0;
+            int primary_stick_set = 0;
 
-                    // Center is ~128. The PS3 controller Y-axis ranges from 0 (UP) to 255 (DOWN).
-                    // Subtracting 128 yields negative values for UP and positive for DOWN.
-                    // Sunshine/Moonlight expects standard Y-axis coordinates where UP is positive and
-                    // DOWN is negative. Therefore, we multiply by -256 to invert the raw signs.
-                    int tempLX = (paddata.ANA_L_H - 128) * 256;
-                    int tempLY = (paddata.ANA_L_V - 128) * -256;
-                    int tempRX = (paddata.ANA_R_H - 128) * 256;
-                    int tempRY = (paddata.ANA_R_V - 128) * -256;
-
-                    leftStickX = tempLX > 32767 ? 32767 : (tempLX < -32768 ? -32768 : tempLX);
-                    leftStickY = tempLY > 32767 ? 32767 : (tempLY < -32768 ? -32768 : tempLY);
-                    rightStickX = tempRX > 32767 ? 32767 : (tempRX < -32768 ? -32768 : tempRX);
-                    rightStickY = tempRY > 32767 ? 32767 : (tempRY < -32768 ? -32768 : tempRY);
-
-                    leftTrigger = paddata.BTN_L2 ? 0xFF : 0x00;
-                    rightTrigger = paddata.BTN_R2 ? 0xFF : 0x00;
-
-                    // Send controller event to Moonlight/Sunshine server
-                    LiSendControllerEvent(buttonFlags, leftTrigger, rightTrigger, leftStickX, leftStickY, rightStickX, rightStickY);
-
-                    // Update shared state for UI
-                    sysMutexLock(pad_state_mutex, 0);
-                    g_pad_state.buttons_down = buttonFlags;
-                    g_pad_state.buttons_pressed |= (buttonFlags & ~last_buttons);
-                    g_pad_state.lx = leftStickX;
-                    g_pad_state.ly = leftStickY;
-                    g_pad_state.rx = rightStickX;
-                    g_pad_state.ry = rightStickY;
-                    sysMutexUnlock(pad_state_mutex);
-
-                    last_buttons = buttonFlags;
+            for (int i = 0; i < PS3_MAX_CONTROLLERS; i++) {
+                if (padinfo.status[i]) {
+                    active_mask |= (uint16_t)(1u << i);
+                    memset(&paddata, 0, sizeof(paddata));
+                    if (ioPadGetData((u32)i, &paddata) == 0 && paddata.len > 0) {
+                        decode_pad_data(&paddata, &ports[i]);
+                        updated[i] = 1;
+                    }
+                    combined_down |= ports[i].buttons;
+                    combined_pressed |= (ports[i].buttons & ~prev_buttons[i]);
+                    prev_buttons[i] = ports[i].buttons;
+                    if (!primary_stick_set) {
+                        ui_lx = ports[i].lx;
+                        ui_ly = ports[i].ly;
+                        ui_rx = ports[i].rx;
+                        ui_ry = ports[i].ry;
+                        primary_stick_set = 1;
+                    }
+                } else {
+                    memset(&ports[i], 0, sizeof(ports[i]));
+                    prev_buttons[i] = 0;
+                    active_small[i] = 0;
+                    active_large[i] = 0;
                 }
             }
-        }
 
-        if (!padinfo.status[0] && last_buttons != 0) {
-            LiSendControllerEvent(0, 0, 0, 0, 0, 0, 0);
+            // Publish aggregated pad state for menus / exit combo and fetch pending rumble updates
+            ps3_rumble_state_t rumble_local[PS3_MAX_CONTROLLERS] = {{0}};
             sysMutexLock(pad_state_mutex, 0);
-            memset(&g_pad_state, 0, sizeof(g_pad_state));
+            g_pad_state.buttons_down = combined_down;
+            g_pad_state.buttons_pressed |= combined_pressed;
+            g_pad_state.lx = ui_lx;
+            g_pad_state.ly = ui_ly;
+            g_pad_state.rx = ui_rx;
+            g_pad_state.ry = ui_ry;
+            for (int i = 0; i < PS3_MAX_CONTROLLERS; i++) {
+                rumble_local[i] = g_rumble_pending[i];
+                g_rumble_pending[i].dirty = 0;
+            }
             sysMutexUnlock(pad_state_mutex);
-            last_buttons = 0;
+
+            // Apply rumble strictly on InputThread; stop any active motors if disconnected
+            for (int i = 0; i < PS3_MAX_CONTROLLERS; i++) {
+                if (!padinfo.status[i]) continue;
+
+                u8 target_small = stream_connected
+                    ? (rumble_local[i].dirty ? rumble_local[i].small_motor : active_small[i])
+                    : 0;
+                u8 target_large = stream_connected
+                    ? (rumble_local[i].dirty ? rumble_local[i].large_motor : active_large[i])
+                    : 0;
+
+                if (target_small != active_small[i] || target_large != active_large[i]) {
+                    padActParam act;
+                    memset(&act, 0, sizeof(act));
+                    act.small_motor = target_small;
+                    act.large_motor = target_large;
+                    ioPadSetActDirect((u32)i, &act);
+                    active_small[i] = target_small;
+                    active_large[i] = target_large;
+                }
+            }
+
+            if (!stream_connected) {
+                announced_mask = 0;
+            } else {
+                // Report disconnected ports first so host clears buttons and activeGamepadMask
+                for (int i = 0; i < PS3_MAX_CONTROLLERS; i++) {
+                    uint16_t bit = (uint16_t)(1u << i);
+                    if ((announced_mask & bit) && !(active_mask & bit)) {
+                        LiSendMultiControllerEvent((short)i, (short)active_mask, 0, 0, 0, 0, 0, 0, 0);
+                        announced_mask &= (uint16_t)~bit;
+                        NLOG("[INPUT] Controller %d disconnected (mask=0x%02x)", i, active_mask);
+                    }
+                }
+
+                // Announce new arrivals and send state updates for active ports
+                for (int i = 0; i < PS3_MAX_CONTROLLERS; i++) {
+                    uint16_t bit = (uint16_t)(1u << i);
+                    if (!(active_mask & bit)) continue;
+
+                    if (!(announced_mask & bit)) {
+                        if (LiSendControllerArrivalEvent((uint8_t)i, active_mask, LI_CTYPE_PS,
+                                                         PS3_SUPPORTED_BUTTON_FLAGS,
+                                                         LI_CCAP_ANALOG_TRIGGERS | LI_CCAP_RUMBLE) == 0) {
+                            announced_mask |= bit;
+                            NLOG("[INPUT] Controller %d connected (mask=0x%02x)", i, active_mask);
+                            if (ports[i].buttons != 0 || ports[i].lt != 0 || ports[i].rt != 0 ||
+                                ports[i].lx != 0 || ports[i].ly != 0 || ports[i].rx != 0 || ports[i].ry != 0) {
+                                updated[i] = 1;
+                            }
+                        }
+                    }
+
+                    if ((announced_mask & bit) && updated[i]) {
+                        LiSendMultiControllerEvent((short)i, (short)active_mask,
+                                                   ports[i].buttons, ports[i].lt, ports[i].rt,
+                                                   ports[i].lx, ports[i].ly, ports[i].rx, ports[i].ry);
+                    }
+                }
+            }
         }
 
         // 2. Mouse Polling (USB / Bluetooth HID Mice)
@@ -420,6 +532,7 @@ void ps3input_start() {
     pad_state_mutex_initialized = 1;
 
     memset(&g_pad_state, 0, sizeof(g_pad_state));
+    memset(g_rumble_pending, 0, sizeof(g_rumble_pending));
     active_input_thread = 1;
     // Priority 200: Input should preempt almost everything except critical network receive (100)
     if (sysThreadCreate(&input_thread, input_loop, 0, 200, 0x8000,
