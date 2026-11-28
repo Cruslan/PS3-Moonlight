@@ -32,13 +32,20 @@ static int ui_thread_started = 0;
 static volatile int ui_running = 1;
 static int ui_width = 1280;
 static int ui_height = 720;
+static float ui_safe_x = 0.0f;
+static float ui_safe_y = 0.0f;
+static float ui_safe_w = 1280.0f;
+static float ui_safe_h = 720.0f;
 static float scale_x = 1.0f;
 static float scale_y = 1.0f;
 static float scale_font = 1.0f;
 static volatile int ui_state = UI_STATE_IP_ENTRY;
 
+// SX/SY scale relative sizes/offsets; UX/UY map 1280x720 virtual coordinates into the overscan safe area.
 #define SX(x) ((float)(x) * scale_x)
 #define SY(y) ((float)(y) * scale_y)
+#define UX(x) (ui_safe_x + ((float)(x) * scale_x))
+#define UY(y) (ui_safe_y + ((float)(y) * scale_y))
 #define SF(s) ((u32)(((float)(s) * scale_font < 8.0f) ? 8.0f : ((float)(s) * scale_font)))
 
 // Host IP state
@@ -66,8 +73,8 @@ static int ui_vsync = 1; // Default: VSync ON (1)
 #define MAIN_MENU_ITEM_COUNT 3
 static int active_main_item = 0; // 0: Sunshine Host IP, 1: Configure Settings, 2: Connect/Pair
 
-#define SETTINGS_ITEM_COUNT 9
-static int active_settings_item = 0; // 0: FPS, 1: Bitrate, 2: Stream Res, 3: Scaling Engine, 4: Mouse, 5: VSync, 6: Stats, 7: Verbose, 8: Back
+#define SETTINGS_ITEM_COUNT 11
+static int active_settings_item = 0; // 0: FPS, 1: Bitrate, 2: Stream Res, 3: Scaling Engine, 4: Overscan X, 5: Overscan Y, 6: Mouse, 7: VSync, 8: Stats, 9: Verbose, 10: Back
 
 static int frames_drawn_this_sec = 0;
 static int ui_fps_actual = 0;
@@ -76,12 +83,16 @@ static int show_stats = 0; // Default: Stats OFF (0)
 static int ui_verbose = 0; // Default: Verbose Logging OFF (0)
 static int ui_mouse_mode = 0; // Default: 0 = Game Mode (Relative), 1 = Desktop Mode (Absolute)
 
-// Aspect ratio & stream resolution states
+// Aspect ratio, stream resolution & per-mode overscan states
 static int ui_display_is_4_3 = 0; // Automatically detected from PS3 display mode
 static int ui_aspect_ratio = ASPECT_RATIO_16_9; // 0: 16:9, 1: 4:3
 static int ui_stream_res_16_9_idx = 0; // 0: 720p (1280x720), 1: 1080p (1920x1080)
 static int ui_stream_res_4_3_idx = 0;  // 0: 1024x768 (XGA), 1: 800x600 (SVGA)
 static int ui_scaling_mode = SCALING_MODE_SHADER; // 0: Shader (Adaptive CAS/Box/1:1), 1: Legacy (Tiny3D Bilinear)
+static int ui_overscan_16_9_x = 0; // Total horizontal overscan inset % for 16:9 mode (0..15)
+static int ui_overscan_16_9_y = 0; // Total vertical overscan inset % for 16:9 mode (0..15)
+static int ui_overscan_4_3_x  = 0; // Total horizontal overscan inset % for 4:3 mode (0..15)
+static int ui_overscan_4_3_y  = 0; // Total vertical overscan inset % for 4:3 mode (0..15)
 static char active_scaling_str[48] = "Shader (Adaptive)";
 
 // OSK management state
@@ -160,6 +171,80 @@ void ui_set_active_scaling_name(const char *name) {
         strncpy(active_scaling_str, name, sizeof(active_scaling_str) - 1);
         active_scaling_str[sizeof(active_scaling_str) - 1] = '\0';
     }
+}
+
+static int clamp_overscan(int pct) {
+    if (pct < OVERSCAN_MIN) return OVERSCAN_MIN;
+    if (pct > OVERSCAN_MAX) return OVERSCAN_MAX;
+    return pct;
+}
+
+/** Return horizontal overscan percentage (0..15) for the active display aspect mode. */
+int ui_get_overscan_x(void) {
+    return (ui_aspect_ratio == ASPECT_RATIO_16_9) ? ui_overscan_16_9_x : ui_overscan_4_3_x;
+}
+
+/** Return vertical overscan percentage (0..15) for the active display aspect mode. */
+int ui_get_overscan_y(void) {
+    return (ui_aspect_ratio == ASPECT_RATIO_16_9) ? ui_overscan_16_9_y : ui_overscan_4_3_y;
+}
+
+/** Set horizontal overscan percentage (clamped to OVERSCAN_MIN..OVERSCAN_MAX) for active display mode. */
+void ui_set_overscan_x(int pct) {
+    int v = clamp_overscan(pct);
+    if (ui_aspect_ratio == ASPECT_RATIO_16_9) {
+        ui_overscan_16_9_x = v;
+    } else {
+        ui_overscan_4_3_x = v;
+    }
+}
+
+/** Set vertical overscan percentage (clamped to OVERSCAN_MIN..OVERSCAN_MAX) for active display mode. */
+void ui_set_overscan_y(int pct) {
+    int v = clamp_overscan(pct);
+    if (ui_aspect_ratio == ASPECT_RATIO_16_9) {
+        ui_overscan_16_9_y = v;
+    } else {
+        ui_overscan_4_3_y = v;
+    }
+}
+
+/** Compute centered overscan-compensated safe rectangle in framebuffer pixels. */
+void ui_get_safe_rect(int total_w, int total_h, int *out_x, int *out_y, int *out_w, int *out_h) {
+    int ox = ui_get_overscan_x();
+    int oy = ui_get_overscan_y();
+    int sx = 0, sy = 0, sw = total_w, sh = total_h;
+
+    if (ox > 0 && total_w > 64) {
+        sw = ((total_w * (100 - ox) + 50) / 100) & ~1;
+        if (sw < 64) sw = 64;
+        if (sw > total_w) sw = total_w;
+        sx = ((total_w - sw) / 2) & ~1;
+    }
+    if (oy > 0 && total_h > 64) {
+        sh = ((total_h * (100 - oy) + 50) / 100) & ~1;
+        if (sh < 64) sh = 64;
+        if (sh > total_h) sh = total_h;
+        sy = ((total_h - sh) / 2) & ~1;
+    }
+
+    if (out_x) *out_x = sx;
+    if (out_y) *out_y = sy;
+    if (out_w) *out_w = sw;
+    if (out_h) *out_h = sh;
+}
+
+/** Recompute cached safe-area origin and 1280x720 virtual scaling factors for UI drawing. */
+static void ui_update_safe_layout(void) {
+    int sx = 0, sy = 0, sw = ui_width, sh = ui_height;
+    ui_get_safe_rect(ui_width, ui_height, &sx, &sy, &sw, &sh);
+    ui_safe_x = (float)sx;
+    ui_safe_y = (float)sy;
+    ui_safe_w = (float)sw;
+    ui_safe_h = (float)sh;
+    scale_x = ui_safe_w / 1280.0f;
+    scale_y = ui_safe_h / 720.0f;
+    scale_font = (scale_x < scale_y) ? scale_x : scale_y;
 }
 
 static char pairing_pin_str[16] = "";
@@ -282,6 +367,10 @@ void ui_save_settings(void) {
         fprintf(f, "res_16_9=%d\n", ui_stream_res_16_9_idx);
         fprintf(f, "res_4_3=%d\n", ui_stream_res_4_3_idx);
         fprintf(f, "scaling_mode=%d\n", (ui_scaling_mode == SCALING_MODE_LEGACY) ? 1 : 0);
+        fprintf(f, "overscan_16_9_x=%d\n", ui_overscan_16_9_x);
+        fprintf(f, "overscan_16_9_y=%d\n", ui_overscan_16_9_y);
+        fprintf(f, "overscan_4_3_x=%d\n", ui_overscan_4_3_x);
+        fprintf(f, "overscan_4_3_y=%d\n", ui_overscan_4_3_y);
         fflush(f);
         fsync(fileno(f));
         fclose(f);
@@ -361,6 +450,14 @@ void ui_load_settings(void) {
                 int v = atoi(v_start);
                 ui_scaling_mode = (v != 0) ? SCALING_MODE_LEGACY : SCALING_MODE_SHADER;
                 explicit_scaling_mode_found = 1;
+            } else if (strcmp(key, "overscan_16_9_x") == 0) {
+                ui_overscan_16_9_x = clamp_overscan(atoi(v_start));
+            } else if (strcmp(key, "overscan_16_9_y") == 0) {
+                ui_overscan_16_9_y = clamp_overscan(atoi(v_start));
+            } else if (strcmp(key, "overscan_4_3_x") == 0) {
+                ui_overscan_4_3_x = clamp_overscan(atoi(v_start));
+            } else if (strcmp(key, "overscan_4_3_y") == 0) {
+                ui_overscan_4_3_y = clamp_overscan(atoi(v_start));
             } else if (strcmp(key, "scaling") == 0) {
                 legacy_scaling_val = atoi(v_start);
             } else if (strcmp(key, "upscaler") == 0) {
@@ -625,9 +722,7 @@ void ui_init(int width, int height, int is_4_3) {
     ui_height = (height > 0) ? height : 720;
     ui_display_is_4_3 = is_4_3;
     ui_aspect_ratio = is_4_3 ? ASPECT_RATIO_4_3 : ASPECT_RATIO_16_9;
-    scale_x = (float)ui_width / 1280.0f;
-    scale_y = (float)ui_height / 720.0f;
-    scale_font = (scale_x < scale_y) ? scale_x : scale_y;
+    ui_update_safe_layout();
 
     sys_mutex_attr_t attr;
     sysMutexAttrInitialize(attr);
@@ -637,8 +732,9 @@ void ui_init(int width, int height, int is_4_3) {
 
     // Load persisted Host IP and stream settings from HDD
     ui_load_settings();
-    // Enforce detected hardware display aspect ratio
+    // Enforce detected hardware display aspect ratio and refresh safe layout with loaded overscan
     ui_aspect_ratio = ui_display_is_4_3 ? ASPECT_RATIO_4_3 : ASPECT_RATIO_16_9;
+    ui_update_safe_layout();
     char cfg_log[96];
     snprintf(cfg_log, sizeof(cfg_log), "Config: Target Host [%s]", target_ip_str);
     ui_push_log(cfg_log);
@@ -673,39 +769,44 @@ void ui_push_log(const char *msg) {
 }
 
 static void draw_background_gradient() {
-    // 1. Base Dark Gray Background (#303030 to #242424)
+    float x0 = ui_safe_x;
+    float y0 = ui_safe_y;
+    float x1 = ui_safe_x + ui_safe_w;
+    float y_split = ui_safe_y + (ui_safe_h * 0.72f);
+
+    // 1. Base Dark Gray Background (#303030 to #242424) inside overscan safe area
     tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
-    tiny3d_VertexPos(0, 0, 65535);
+    tiny3d_VertexPos(x0, y0, 65535);
     tiny3d_VertexFcolor(0.188f, 0.188f, 0.188f, 1.0f); // #303030
-    tiny3d_VertexPos(ui_width, 0, 65535);
+    tiny3d_VertexPos(x1, y0, 65535);
     tiny3d_VertexFcolor(0.188f, 0.188f, 0.188f, 1.0f);
-    tiny3d_VertexPos(0, ui_height * 0.72f, 65535);
+    tiny3d_VertexPos(x0, y_split, 65535);
     tiny3d_VertexFcolor(0.141f, 0.141f, 0.141f, 1.0f); // #242424
-    tiny3d_VertexPos(ui_width, ui_height * 0.72f, 65535);
+    tiny3d_VertexPos(x1, y_split, 65535);
     tiny3d_VertexFcolor(0.141f, 0.141f, 0.141f, 1.0f);
     tiny3d_End();
 
     // 2. Titlebar Header Bar (#3F51B5 Material Indigo Blue)
     tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
-    tiny3d_VertexPos(0, 0, 65535);
+    tiny3d_VertexPos(x0, y0, 65535);
     tiny3d_VertexFcolor(0.247f, 0.318f, 0.710f, 1.0f); // #3F51B5
-    tiny3d_VertexPos(ui_width, 0, 65535);
+    tiny3d_VertexPos(x1, y0, 65535);
     tiny3d_VertexFcolor(0.247f, 0.318f, 0.710f, 1.0f);
-    tiny3d_VertexPos(0, SY(64), 65535);
+    tiny3d_VertexPos(x0, UY(64), 65535);
     tiny3d_VertexFcolor(0.200f, 0.260f, 0.620f, 1.0f);
-    tiny3d_VertexPos(ui_width, SY(64), 65535);
+    tiny3d_VertexPos(x1, UY(64), 65535);
     tiny3d_VertexFcolor(0.200f, 0.260f, 0.620f, 1.0f);
     tiny3d_End();
 
     // 3. Titlebar Bottom Accent Line (#1A237E Deep Indigo)
     tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
-    tiny3d_VertexPos(0, SY(64), 65535);
+    tiny3d_VertexPos(x0, UY(64), 65535);
     tiny3d_VertexFcolor(0.102f, 0.137f, 0.494f, 1.0f);
-    tiny3d_VertexPos(ui_width, SY(64), 65535);
+    tiny3d_VertexPos(x1, UY(64), 65535);
     tiny3d_VertexFcolor(0.102f, 0.137f, 0.494f, 1.0f);
-    tiny3d_VertexPos(0, SY(67), 65535);
+    tiny3d_VertexPos(x0, UY(67), 65535);
     tiny3d_VertexFcolor(0.102f, 0.137f, 0.494f, 1.0f);
-    tiny3d_VertexPos(ui_width, SY(67), 65535);
+    tiny3d_VertexPos(x1, UY(67), 65535);
     tiny3d_VertexFcolor(0.102f, 0.137f, 0.494f, 1.0f);
     tiny3d_End();
 }
@@ -945,12 +1046,10 @@ static void ui_loop(void *arg) {
         // Pump sysutil event callbacks to service OSK and GameOS events
         sysUtilCheckCallback();
         ps3input_get_data(&pad);
-        
-        if (ui_state == UI_STATE_STREAMING) {
-            tiny3d_Clear(0x00000000, TINY3D_CLEAR_ALL); // Pure pitch black letterbox/pillarbox background
-        } else {
-            tiny3d_Clear(0x20202000, TINY3D_CLEAR_ALL); // Neutral dark gray UI background (no blue tint)
-        }
+        ui_update_safe_layout();
+
+        // Always clear outer frame to pure black so overscan safe-area borders stay clean
+        tiny3d_Clear(0x00000000, TINY3D_CLEAR_ALL);
         
         // Service deferred debounced configuration save (prevents I/O stutter on rapid menu clicks)
         if (ui_settings_dirty) {
@@ -1058,7 +1157,23 @@ static void ui_loop(void *arg) {
                         mark_settings_dirty();
                     }
                 }
-            } else if (active_settings_item == 4) {
+            } else if (active_settings_item == 4 || active_settings_item == 5) {
+                // Overscan X (item 4) or Y (item 5) for active 16:9 / 4:3 display mode (0..15%)
+                int is_y = (active_settings_item == 5);
+                int cur = is_y ? ui_get_overscan_y() : ui_get_overscan_x();
+                int next = cur;
+                if (pad.buttons_pressed & A_FLAG) {
+                    next = (cur + 1) % (OVERSCAN_MAX + 1);
+                } else if (pad.buttons_pressed & LEFT_FLAG) {
+                    if (cur > OVERSCAN_MIN) next = cur - 1;
+                } else if (pad.buttons_pressed & RIGHT_FLAG) {
+                    if (cur < OVERSCAN_MAX) next = cur + 1;
+                }
+                if (next != cur) {
+                    if (is_y) ui_set_overscan_y(next); else ui_set_overscan_x(next);
+                    mark_settings_dirty();
+                }
+            } else if (active_settings_item == 6) {
                 // Mouse Mode toggle (0: Game / Relative <-> 1: Desktop / Absolute)
                 if (pad.buttons_pressed & A_FLAG) {
                     ui_mouse_mode = !ui_mouse_mode;
@@ -1068,7 +1183,7 @@ static void ui_loop(void *arg) {
                 } else if (pad.buttons_pressed & RIGHT_FLAG) {
                     if (ui_mouse_mode != 1) { ui_mouse_mode = 1; mark_settings_dirty(); }
                 }
-            } else if (active_settings_item == 5) {
+            } else if (active_settings_item == 7) {
                 // VSync toggle
                 if (pad.buttons_pressed & A_FLAG) {
                     ui_vsync = !ui_vsync;
@@ -1087,7 +1202,7 @@ static void ui_loop(void *arg) {
                         mark_settings_dirty();
                     }
                 }
-            } else if (active_settings_item == 6) {
+            } else if (active_settings_item == 8) {
                 // Stats overlay toggle
                 if (pad.buttons_pressed & A_FLAG) {
                     show_stats = !show_stats;
@@ -1097,7 +1212,7 @@ static void ui_loop(void *arg) {
                 } else if (pad.buttons_pressed & RIGHT_FLAG) {
                     if (show_stats != 1) { show_stats = 1; mark_settings_dirty(); }
                 }
-            } else if (active_settings_item == 7) {
+            } else if (active_settings_item == 9) {
                 // Verbose logging toggle
                 if (pad.buttons_pressed & A_FLAG) {
                     ui_verbose = !ui_verbose;
@@ -1107,7 +1222,7 @@ static void ui_loop(void *arg) {
                 } else if (pad.buttons_pressed & RIGHT_FLAG) {
                     if (ui_verbose != 1) { ui_verbose = 1; mark_settings_dirty(); }
                 }
-            } else if (active_settings_item == 8) {
+            } else if (active_settings_item == 10) {
                 // Back to Main Menu
                 if (pad.buttons_pressed & A_FLAG) {
                     ui_flush_settings_if_dirty();
@@ -1171,8 +1286,8 @@ static void ui_loop(void *arg) {
             
             // Draw Video Performance Stats HUD (Top Left) if enabled
             if (show_stats) {
-                float sx = SX(30);
-                float sy = SY(30);
+                float sx = UX(30);
+                float sy = UY(30);
                 float line_h = SY(20);
                 float hud_w = SX(390);
                 float hud_h = 15.2f * line_h;
@@ -1246,32 +1361,32 @@ static void ui_loop(void *arg) {
                 // Title inside #3F51B5 header bar
                 SetFontSize(SF(26), SF(26));
                 SetFontColor(0xffffffff, 0);
-                DrawString(SX(40), SY(18), "Moonlight PS3");
+                DrawString(UX(40), UY(18), "Moonlight PS3");
                 
                 // Row 0: Sunshine Host
                 SetFontSize(SF(24), SF(24));
                 SetFontColor((active_main_item == 0) ? 0xff82b1ff : 0xffb0bec5, 0);
-                float next_x = DrawString(SX(60), SY(125), "Sunshine Host:");
+                float next_x = DrawString(UX(60), UY(125), "Sunshine Host:");
                 
                 SetFontColor((active_main_item == 0) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawFormatString(next_x + SX(20), SY(125), "[ %s ]", target_ip_str);
+                DrawFormatString(next_x + SX(20), UY(125), "[ %s ]", target_ip_str);
 
                 // Row 1: Settings Sub-menu Link
                 SetFontSize(SF(24), SF(24));
                 SetFontColor((active_main_item == 1) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawString(SX(60), SY(185), "[ CONFIGURE STREAM SETTINGS ]");
+                DrawString(UX(60), UY(185), "[ CONFIGURE STREAM SETTINGS ]");
                 
                 // Active settings summary preview
                 SetFontSize(SF(18), SF(18));
                 SetFontColor(0xff9e9e9e, 0);
                 int kbps = ui_bitrate_options[ui_bitrate_idx];
                 if (kbps % 1000 == 0) {
-                    DrawFormatString(SX(60), SY(225), "Current: %d FPS | %d Mbps | %s | %s | %s", 
+                    DrawFormatString(UX(60), UY(225), "Current: %d FPS | %d Mbps | %s | %s | %s", 
                                      ui_fps, kbps / 1000, 
                                      ui_display_is_4_3 ? "4:3 Display" : "16:9 Display",
                                      ui_get_stream_res_name(), ui_get_scaling_mode_name());
                 } else {
-                    DrawFormatString(SX(60), SY(225), "Current: %d FPS | %.1f Mbps | %s | %s | %s", 
+                    DrawFormatString(UX(60), UY(225), "Current: %d FPS | %.1f Mbps | %s | %s | %s", 
                                      ui_fps, (float)kbps / 1000.0f,
                                      ui_display_is_4_3 ? "4:3 Display" : "16:9 Display",
                                      ui_get_stream_res_name(), ui_get_scaling_mode_name());
@@ -1280,160 +1395,172 @@ static void ui_loop(void *arg) {
                 // Row 2: Connect / Pair Action Button
                 SetFontSize(SF(24), SF(24));
                 SetFontColor((active_main_item == 2) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawString(SX(60), SY(280), "[ CONNECT / PAIR TO HOST ]");
+                DrawString(UX(60), UY(280), "[ CONNECT / PAIR TO HOST ]");
 
                 // Clean controls legend
                 SetFontSize(SF(18), SF(18));
                 SetFontColor(0xff9e9e9e, 0);
-                DrawString(SX(60), SY(445), "\x05 Navigate   |   \x01 Select   |   \x02 Exit to XMB");
+                DrawString(UX(60), UY(445), "\x05 Navigate   |   \x01 Select   |   \x02 Exit to XMB");
             } else if (ui_state == UI_STATE_SETTINGS) {
                 // Title inside #3F51B5 header bar
                 SetFontSize(SF(26), SF(26));
                 SetFontColor(0xffffffff, 0);
-                DrawString(SX(40), SY(18), "Moonlight PS3  -  Stream Settings");
+                DrawString(UX(40), UY(18), "Moonlight PS3  -  Stream Settings");
 
                 // Row 0: Target FPS
                 SetFontSize(SF(19), SF(19));
                 SetFontColor((active_settings_item == 0) ? 0xff82b1ff : 0xffb0bec5, 0);
-                DrawString(SX(60), SY(92), "Target FPS:");
+                DrawString(UX(60), UY(86), "Target FPS:");
                 SetFontColor((active_settings_item == 0) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawFormatString(SX(430), SY(92), "[ %d FPS ]", ui_fps);
+                DrawFormatString(UX(430), UY(86), "[ %d FPS ]", ui_fps);
 
                 // Row 1: Target Bitrate
                 SetFontColor((active_settings_item == 1) ? 0xff82b1ff : 0xffb0bec5, 0);
-                DrawString(SX(60), SY(122), "Target Bitrate:");
+                DrawString(UX(60), UY(114), "Target Bitrate:");
                 SetFontColor((active_settings_item == 1) ? 0xff82b1ff : 0xffffffff, 0);
                 int kbps = ui_bitrate_options[ui_bitrate_idx];
                 if (kbps % 1000 == 0) {
-                    DrawFormatString(SX(430), SY(122), "[ %d Mbps ]", kbps / 1000);
+                    DrawFormatString(UX(430), UY(114), "[ %d Mbps ]", kbps / 1000);
                 } else {
-                    DrawFormatString(SX(430), SY(122), "[ %.1f Mbps ]", (float)kbps / 1000.0f);
+                    DrawFormatString(UX(430), UY(114), "[ %.1f Mbps ]", (float)kbps / 1000.0f);
                 }
 
                 // Row 2: Stream Resolution (strictly filtered to active display!)
                 SetFontColor((active_settings_item == 2) ? 0xff82b1ff : 0xffb0bec5, 0);
-                DrawFormatString(SX(60), SY(152), "Stream Res (%s):", ui_display_is_4_3 ? "4:3 Display" : "16:9 Display");
+                DrawFormatString(UX(60), UY(142), "Stream Res (%s):", ui_display_is_4_3 ? "4:3 Display" : "16:9 Display");
                 SetFontColor((active_settings_item == 2) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawFormatString(SX(430), SY(152), "[ %s ]", ui_get_stream_res_name());
+                DrawFormatString(UX(430), UY(142), "[ %s ]", ui_get_stream_res_name());
 
                 // Row 3: Scaling Engine
                 SetFontColor((active_settings_item == 3) ? 0xff82b1ff : 0xffb0bec5, 0);
-                DrawString(SX(60), SY(182), "Scaling Engine:");
+                DrawString(UX(60), UY(170), "Scaling Engine:");
                 SetFontColor((active_settings_item == 3) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawFormatString(SX(430), SY(182), "[ %s ]", ui_get_scaling_mode_name());
+                DrawFormatString(UX(430), UY(170), "[ %s ]", ui_get_scaling_mode_name());
 
-                // Row 4: Mouse Mode
+                // Row 4: Overscan X (Horizontal, active display aspect mode only)
                 SetFontColor((active_settings_item == 4) ? 0xff82b1ff : 0xffb0bec5, 0);
-                DrawString(SX(60), SY(212), "Mouse Mode:");
+                DrawFormatString(UX(60), UY(198), "Overscan X (%s):", ui_display_is_4_3 ? "4:3" : "16:9");
                 SetFontColor((active_settings_item == 4) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawFormatString(SX(430), SY(212), "[ %s ]", (ui_mouse_mode == 0) ? "GAME (Relative / 3D)" : "DESKTOP (Absolute / 1:1)");
+                DrawFormatString(UX(430), UY(198), "[ %d%% ]", ui_get_overscan_x());
 
-                // Row 5: VSync Mode
+                // Row 5: Overscan Y (Vertical, active display aspect mode only)
                 SetFontColor((active_settings_item == 5) ? 0xff82b1ff : 0xffb0bec5, 0);
-                DrawString(SX(60), SY(242), "VSync Mode:");
+                DrawFormatString(UX(60), UY(226), "Overscan Y (%s):", ui_display_is_4_3 ? "4:3" : "16:9");
                 SetFontColor((active_settings_item == 5) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawFormatString(SX(430), SY(242), "[ %s ]", ui_vsync ? "ON (Smooth 60Hz)" : "OFF (Low Latency)");
+                DrawFormatString(UX(430), UY(226), "[ %d%% ]", ui_get_overscan_y());
 
-                // Row 6: Stats Overlay
+                // Row 6: Mouse Mode
                 SetFontColor((active_settings_item == 6) ? 0xff82b1ff : 0xffb0bec5, 0);
-                DrawString(SX(60), SY(272), "Stats Overlay:");
+                DrawString(UX(60), UY(254), "Mouse Mode:");
                 SetFontColor((active_settings_item == 6) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawFormatString(SX(430), SY(272), "[ %s ]", show_stats ? "ON" : "OFF");
+                DrawFormatString(UX(430), UY(254), "[ %s ]", (ui_mouse_mode == 0) ? "GAME (Relative / 3D)" : "DESKTOP (Absolute / 1:1)");
 
-                // Row 7: Verbose Logging
+                // Row 7: VSync Mode
                 SetFontColor((active_settings_item == 7) ? 0xff82b1ff : 0xffb0bec5, 0);
-                DrawString(SX(60), SY(302), "Verbose Logging:");
+                DrawString(UX(60), UY(282), "VSync Mode:");
                 SetFontColor((active_settings_item == 7) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawFormatString(SX(430), SY(302), "[ %s ]", ui_verbose ? "ON" : "OFF");
+                DrawFormatString(UX(430), UY(282), "[ %s ]", ui_vsync ? "ON (Smooth 60Hz)" : "OFF (Low Latency)");
 
-                // Row 8: Back to Main Menu Button
-                SetFontSize(SF(21), SF(21));
+                // Row 8: Stats Overlay
+                SetFontColor((active_settings_item == 8) ? 0xff82b1ff : 0xffb0bec5, 0);
+                DrawString(UX(60), UY(310), "Stats Overlay:");
                 SetFontColor((active_settings_item == 8) ? 0xff82b1ff : 0xffffffff, 0);
-                DrawString(SX(60), SY(345), "[ BACK TO MAIN MENU ]");
+                DrawFormatString(UX(430), UY(310), "[ %s ]", show_stats ? "ON" : "OFF");
+
+                // Row 9: Verbose Logging
+                SetFontColor((active_settings_item == 9) ? 0xff82b1ff : 0xffb0bec5, 0);
+                DrawString(UX(60), UY(338), "Verbose Logging:");
+                SetFontColor((active_settings_item == 9) ? 0xff82b1ff : 0xffffffff, 0);
+                DrawFormatString(UX(430), UY(338), "[ %s ]", ui_verbose ? "ON" : "OFF");
+
+                // Row 10: Back to Main Menu Button
+                SetFontSize(SF(21), SF(21));
+                SetFontColor((active_settings_item == 10) ? 0xff82b1ff : 0xffffffff, 0);
+                DrawString(UX(60), UY(374), "[ BACK TO MAIN MENU ]");
 
                 // Clean controls legend
                 SetFontSize(SF(18), SF(18));
                 SetFontColor(0xff9e9e9e, 0);
-                DrawString(SX(60), SY(445), "\x05 Navigate   |   \x01 Select / Change   |   \x02 Back");
+                DrawString(UX(60), UY(456), "\x05 Navigate   |   \x01 Select / Change   |   \x02 Back");
             } else if (ui_state == UI_STATE_PAIRING) {
                 // Title inside #3F51B5 header bar
                 SetFontSize(SF(26), SF(26));
                 SetFontColor(0xffffffff, 0);
-                DrawString(SX(40), SY(18), "Moonlight PS3  -  Device Pairing");
+                DrawString(UX(40), UY(18), "Moonlight PS3  -  Device Pairing");
 
                 if (pairing_pin_str[0] != '\0') {
                     // Heading
                     SetFontSize(SF(24), SF(24));
                     SetFontColor(0xffffffff, 0);
-                    DrawString(SX(60), SY(110), "Sunshine Pairing Required");
+                    DrawString(UX(60), UY(110), "Sunshine Pairing Required");
 
                     // Subheading instructions
                     SetFontSize(SF(18), SF(18));
                     SetFontColor(0xffb0bec5, 0);
-                    DrawString(SX(60), SY(150), "Open Sunshine Web UI (PIN Tab) and enter this PIN:");
+                    DrawString(UX(60), UY(150), "Open Sunshine Web UI (PIN Tab) and enter this PIN:");
 
                     // PIN Badge Card Container (#1E1E1E background with #3F51B5 top accent line)
                     tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
-                    tiny3d_VertexPos(SX(60), SY(190), 65535);
+                    tiny3d_VertexPos(UX(60), UY(190), 65535);
                     tiny3d_VertexFcolor(0.12f, 0.12f, 0.12f, 0.95f);
-                    tiny3d_VertexPos(SX(400), SY(190), 65535);
+                    tiny3d_VertexPos(UX(400), UY(190), 65535);
                     tiny3d_VertexFcolor(0.12f, 0.12f, 0.12f, 0.95f);
-                    tiny3d_VertexPos(SX(60), SY(275), 65535);
+                    tiny3d_VertexPos(UX(60), UY(275), 65535);
                     tiny3d_VertexFcolor(0.12f, 0.12f, 0.12f, 0.95f);
-                    tiny3d_VertexPos(SX(400), SY(275), 65535);
+                    tiny3d_VertexPos(UX(400), UY(275), 65535);
                     tiny3d_VertexFcolor(0.12f, 0.12f, 0.12f, 0.95f);
                     tiny3d_End();
 
                     // Top Accent Line (#3F51B5)
                     tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
-                    tiny3d_VertexPos(SX(60), SY(190), 65535);
+                    tiny3d_VertexPos(UX(60), UY(190), 65535);
                     tiny3d_VertexFcolor(0.247f, 0.318f, 0.710f, 1.0f);
-                    tiny3d_VertexPos(SX(400), SY(190), 65535);
+                    tiny3d_VertexPos(UX(400), UY(190), 65535);
                     tiny3d_VertexFcolor(0.247f, 0.318f, 0.710f, 1.0f);
-                    tiny3d_VertexPos(SX(60), SY(193), 65535);
+                    tiny3d_VertexPos(UX(60), UY(193), 65535);
                     tiny3d_VertexFcolor(0.247f, 0.318f, 0.710f, 1.0f);
-                    tiny3d_VertexPos(SX(400), SY(193), 65535);
+                    tiny3d_VertexPos(UX(400), UY(193), 65535);
                     tiny3d_VertexFcolor(0.247f, 0.318f, 0.710f, 1.0f);
                     tiny3d_End();
 
                     // PIN Text in large bold highlight
                     SetFontSize(SF(34), SF(34));
                     SetFontColor(0xff82b1ff, 0); // Rose / Pink highlight
-                    DrawFormatString(SX(85), SY(218), "PIN:  %s", pairing_pin_str);
+                    DrawFormatString(UX(85), UY(218), "PIN:  %s", pairing_pin_str);
 
                     // Waiting status
                     SetFontSize(SF(18), SF(18));
                     SetFontColor(0xff9e9e9e, 0);
-                    DrawString(SX(60), SY(305), "Waiting for confirmation from host...");
+                    DrawString(UX(60), UY(305), "Waiting for confirmation from host...");
                 } else {
                     SetFontSize(SF(24), SF(24));
                     SetFontColor(0xff82b1ff, 0);
-                    DrawString(SX(60), SY(180), "Connecting to Sunshine Host...");
+                    DrawString(UX(60), UY(180), "Connecting to Sunshine Host...");
 
                     SetFontSize(SF(18), SF(18));
                     SetFontColor(0xffb0bec5, 0);
-                    DrawString(SX(60), SY(220), "Initializing handshake session...");
+                    DrawString(UX(60), UY(220), "Initializing handshake session...");
                 }
 
                 // Bottom cancel button legend
                 SetFontSize(SF(18), SF(18));
                 SetFontColor(0xff9e9e9e, 0);
-                DrawString(SX(60), SY(445), "\x02 Cancel Pairing");
+                DrawString(UX(60), UY(445), "\x02 Cancel Pairing");
             } else if (ui_state == UI_STATE_APPLIST) {
                 // Title inside #3F51B5 header bar
                 SetFontSize(SF(26), SF(26));
                 SetFontColor(0xffffffff, 0);
-                DrawString(SX(40), SY(18), "Moonlight PS3  -  Host Applications");
+                DrawString(UX(40), UY(18), "Moonlight PS3  -  Host Applications");
 
                 // Subtitle
                 SetFontSize(SF(22), SF(22));
                 SetFontColor(0xffffffff, 0);
-                DrawString(SX(60), SY(95), "Select Game or Application to Stream:");
+                DrawString(UX(60), UY(95), "Select Game or Application to Stream:");
 
                 if (current_app_list.count > 0) {
                     SetFontSize(SF(18), SF(18));
                     SetFontColor(0xffb0bec5, 0);
-                    DrawFormatString(SX(480), SY(95), "[ %d / %d ]", active_app_idx + 1, current_app_list.count);
+                    DrawFormatString(UX(480), UY(95), "[ %d / %d ]", active_app_idx + 1, current_app_list.count);
 
                     // Render visible applications list
                     #define MAX_VISIBLE_APPS 6
@@ -1446,57 +1573,57 @@ static void ui_loop(void *arg) {
 
                     for (int i = 0; i < visible_count; i++) {
                         int idx = start_idx + i;
-                        float row_y = SY(135) + (i * SY(48));
+                        float row_y = UY(135) + (i * SY(48));
 
                         if (idx == active_app_idx) {
                             // Active selection card background (#242424 with pink accent border)
                             tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
-                            tiny3d_VertexPos(SX(55), row_y, 65535);
+                            tiny3d_VertexPos(UX(55), row_y, 65535);
                             tiny3d_VertexFcolor(0.16f, 0.16f, 0.16f, 0.95f);
-                            tiny3d_VertexPos(SX(850), row_y, 65535);
+                            tiny3d_VertexPos(UX(850), row_y, 65535);
                             tiny3d_VertexFcolor(0.16f, 0.16f, 0.16f, 0.95f);
-                            tiny3d_VertexPos(SX(55), row_y + SY(40), 65535);
+                            tiny3d_VertexPos(UX(55), row_y + SY(40), 65535);
                             tiny3d_VertexFcolor(0.16f, 0.16f, 0.16f, 0.95f);
-                            tiny3d_VertexPos(SX(850), row_y + SY(40), 65535);
+                            tiny3d_VertexPos(UX(850), row_y + SY(40), 65535);
                             tiny3d_VertexFcolor(0.16f, 0.16f, 0.16f, 0.95f);
                             tiny3d_End();
 
                             // Left Accent Line (#FF82B1)
                             tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
-                            tiny3d_VertexPos(SX(55), row_y, 65535);
+                            tiny3d_VertexPos(UX(55), row_y, 65535);
                             tiny3d_VertexFcolor(1.0f, 0.51f, 0.69f, 1.0f);
-                            tiny3d_VertexPos(SX(59), row_y, 65535);
+                            tiny3d_VertexPos(UX(59), row_y, 65535);
                             tiny3d_VertexFcolor(1.0f, 0.51f, 0.69f, 1.0f);
-                            tiny3d_VertexPos(SX(55), row_y + SY(40), 65535);
+                            tiny3d_VertexPos(UX(55), row_y + SY(40), 65535);
                             tiny3d_VertexFcolor(1.0f, 0.51f, 0.69f, 1.0f);
-                            tiny3d_VertexPos(SX(59), row_y + SY(40), 65535);
+                            tiny3d_VertexPos(UX(59), row_y + SY(40), 65535);
                             tiny3d_VertexFcolor(1.0f, 0.51f, 0.69f, 1.0f);
                             tiny3d_End();
 
                             SetFontSize(SF(22), SF(22));
                             SetFontColor(0xff82b1ff, 0); // Pink highlight
-                            DrawFormatString(SX(70), row_y + SY(8), "[ > ]  %s", current_app_list.apps[idx].name);
+                            DrawFormatString(UX(70), row_y + SY(8), "[ > ]  %s", current_app_list.apps[idx].name);
                         } else {
                             SetFontSize(SF(20), SF(20));
                             SetFontColor(0xffb0bec5, 0);
-                            DrawFormatString(SX(70), row_y + SY(8), "       %s", current_app_list.apps[idx].name);
+                            DrawFormatString(UX(70), row_y + SY(8), "       %s", current_app_list.apps[idx].name);
                         }
                     }
                 } else {
                     SetFontSize(SF(22), SF(22));
                     SetFontColor(0xffff82b1, 0);
-                    DrawString(SX(60), SY(180), "No applications found on host.");
+                    DrawString(UX(60), UY(180), "No applications found on host.");
                 }
 
                 // Clean controls legend
                 SetFontSize(SF(18), SF(18));
                 SetFontColor(0xff9e9e9e, 0);
-                DrawString(SX(60), SY(445), "\x05 Navigate   |   \x01 Launch Game   |   \x02 Cancel");
+                DrawString(UX(60), UY(445), "\x05 Navigate   |   \x01 Launch Game   |   \x02 Cancel");
             } else if (ui_state == UI_STATE_ERROR) {
                 SetFontSize(SF(26), SF(26));
                 SetFontColor(0xffff5252, 0);
-                DrawString(SX(60), SY(200), "ERROR: Target unreachable or Pairing failed.");
-                DrawString(SX(60), SY(260), "Press \x01 to return.");
+                DrawString(UX(60), UY(200), "ERROR: Target unreachable or Pairing failed.");
+                DrawString(UX(60), UY(260), "Press \x01 to return.");
                 if (pad.buttons_pressed & A_FLAG) ui_state = UI_STATE_IP_ENTRY;
             }
         }
@@ -1513,34 +1640,39 @@ static void ui_loop(void *arg) {
             }
             if (log_mutex_initialized) sysMutexUnlock(log_mutex);
 
-            // Log container background (#1E1E1E)
+            float log_x0 = ui_safe_x;
+            float log_x1 = ui_safe_x + ui_safe_w;
+            float log_y0 = ui_safe_y + (ui_safe_h * 0.72f);
+            float log_y1 = ui_safe_y + ui_safe_h;
+
+            // Log container background (#1E1E1E) inside overscan safe area
             tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
-            tiny3d_VertexPos(0, ui_height * 0.72f, 65535);
+            tiny3d_VertexPos(log_x0, log_y0, 65535);
             tiny3d_VertexFcolor(0.118f, 0.118f, 0.118f, 0.95f);
-            tiny3d_VertexPos(ui_width, ui_height * 0.72f, 65535);
+            tiny3d_VertexPos(log_x1, log_y0, 65535);
             tiny3d_VertexFcolor(0.118f, 0.118f, 0.118f, 0.95f);
-            tiny3d_VertexPos(0, ui_height, 65535);
+            tiny3d_VertexPos(log_x0, log_y1, 65535);
             tiny3d_VertexFcolor(0.090f, 0.090f, 0.090f, 0.95f);
-            tiny3d_VertexPos(ui_width, ui_height, 65535);
+            tiny3d_VertexPos(log_x1, log_y1, 65535);
             tiny3d_VertexFcolor(0.090f, 0.090f, 0.090f, 0.95f);
             tiny3d_End();
 
             // Log header accent line (#3F51B5)
             tiny3d_SetPolygon(TINY3D_TRIANGLE_STRIP);
-            tiny3d_VertexPos(0, ui_height * 0.72f, 65535);
+            tiny3d_VertexPos(log_x0, log_y0, 65535);
             tiny3d_VertexFcolor(0.247f, 0.318f, 0.710f, 0.8f);
-            tiny3d_VertexPos(ui_width, ui_height * 0.72f, 65535);
+            tiny3d_VertexPos(log_x1, log_y0, 65535);
             tiny3d_VertexFcolor(0.247f, 0.318f, 0.710f, 0.8f);
-            tiny3d_VertexPos(0, (ui_height * 0.72f) + SY(2), 65535);
+            tiny3d_VertexPos(log_x0, log_y0 + SY(2), 65535);
             tiny3d_VertexFcolor(0.247f, 0.318f, 0.710f, 0.8f);
-            tiny3d_VertexPos(ui_width, (ui_height * 0.72f) + SY(2), 65535);
+            tiny3d_VertexPos(log_x1, log_y0 + SY(2), 65535);
             tiny3d_VertexFcolor(0.247f, 0.318f, 0.710f, 0.8f);
             tiny3d_End();
 
             SetFontSize(SF(16), SF(16));
             SetFontColor(0xff80d8ff, 0); // Light Material Cyan/Blue for log readability
             for (int i = 0; i < visible_log_count; i++) {
-                DrawString(SX(20), (ui_height * 0.73f) + (i * SY(19)), visible_logs[i]);
+                DrawString(UX(20), (ui_safe_y + (ui_safe_h * 0.73f)) + (i * SY(19)), visible_logs[i]);
             }
         }
 

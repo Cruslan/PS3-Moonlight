@@ -907,39 +907,48 @@ void ps3video_draw() {
       screen_height = video_height;
   }
 
+  // Compute safe display rectangle accounting for per-mode X/Y overscan margins.
+  int safe_x = 0, safe_y = 0, safe_w = screen_width, safe_h = screen_height;
+  ui_get_safe_rect(screen_width, screen_height, &safe_x, &safe_y, &safe_w, &safe_h);
+
   // Determine whether active display is operating in HD mode (1080p, 720p)
   // or SD mode (576p, 480p across all aspect ratios).
   int is_hd_mode = ps3video_is_hd_mode(screen_width, screen_height);
 
   // Compute destination rectangle with hardware Display Aspect Ratio (DAR) correction.
   // Standard definition (480p/576p) rasters use non-square anamorphic pixels (SAR != DAR).
-  // Comparing physical stream DAR against physical display DAR guarantees correct geometry
-  // and zero letterboxing when 16:9 stream is rendered on 16:9 display (even on 576p/480p).
+  // Deriving physical pixel DAR ensures independent X/Y overscan never squashes geometry.
   float stream_dar = (float)video_width / (float)video_height;
   float display_dar = (ui_get_aspect_ratio() == ASPECT_RATIO_4_3) ? (4.0f / 3.0f) : (16.0f / 9.0f);
-  float rel = stream_dar / display_dar;
+  float pixel_dar = display_dar / ((float)screen_width / (float)screen_height);
+  float safe_dar = ((float)safe_w / (float)safe_h) * pixel_dar;
+  float rel = stream_dar / safe_dar;
 
-  int dst_x = 0, dst_y = 0;
-  int dst_w = screen_width, dst_h = screen_height;
+  int dst_x = safe_x, dst_y = safe_y;
+  int dst_w = safe_w, dst_h = safe_h;
 
   if (rel < 0.98f) {
-      // Stream is narrower than physical display (e.g. 4:3 stream on 16:9 screen) -> Pillarbox
-      dst_h = screen_height;
-      dst_w = (int)((float)screen_width * rel + 0.5f);
-      dst_x = (screen_width - dst_w) / 2;
-      dst_y = 0;
+      // Stream is narrower than safe area (e.g. 4:3 stream on 16:9 screen) -> Pillarbox
+      dst_h = safe_h;
+      dst_w = ((int)((float)safe_w * rel + 0.5f)) & ~1;
+      if (dst_w > safe_w) dst_w = safe_w;
+      if (dst_w < 64) dst_w = 64;
+      dst_x = safe_x + ((safe_w - dst_w) / 2);
+      dst_y = safe_y;
   } else if (rel > 1.02f) {
-      // Stream is wider than physical display (e.g. 16:9 stream on 4:3 screen) -> Letterbox
-      dst_w = screen_width;
-      dst_h = (int)((float)screen_height / rel + 0.5f);
-      dst_x = 0;
-      dst_y = (screen_height - dst_h) / 2;
+      // Stream is wider than safe area (e.g. 16:9 stream on 4:3 screen) -> Letterbox
+      dst_w = safe_w;
+      dst_h = ((int)((float)safe_h / rel + 0.5f)) & ~1;
+      if (dst_h > safe_h) dst_h = safe_h;
+      if (dst_h < 64) dst_h = 64;
+      dst_x = safe_x;
+      dst_y = safe_y + ((safe_h - dst_h) / 2);
   } else {
-      // Stream matches display aspect ratio (e.g. 16:9 on 16:9 or 4:3 on 4:3) -> Full raster stretch
-      dst_w = screen_width;
-      dst_h = screen_height;
-      dst_x = 0;
-      dst_y = 0;
+      // Stream matches safe area aspect ratio -> Fill safe rectangle
+      dst_w = safe_w;
+      dst_h = safe_h;
+      dst_x = safe_x;
+      dst_y = safe_y;
   }
 
   // Determine scaling method
@@ -947,7 +956,8 @@ void ps3video_draw() {
   // SCALING_MODE_SHADER (0):
   //   - input == output (video_width == dst_w && video_height == dst_h): 1:1 Direct Passthrough (Tiny3D direct)
   //   - input < output (video_width < dst_w || video_height < dst_h): CAS 5-Tap Upscale
-  //   - input > output (video_width > dst_w || video_height > dst_h): 4-Tap Bilinear Box Downscale
+  //   - mild overscan shrink (>= 85% of source on both axes): Tiny3D Bilinear Fit (avoids 4x4 box softening on text)
+  //   - input > output: 4-Tap Bilinear Box Downscale
   // SCALING_MODE_LEGACY (1):
   //   - Legacy Bilinear / Direct texture mapping via Tiny3D (no custom fragment shaders)
   int scaling_pref = ui_get_scaling_mode();
@@ -960,6 +970,9 @@ void ps3video_draw() {
       } else if (video_width < dst_w || video_height < dst_h) {
           active_method = 1;
           ui_set_active_scaling_name(is_hd_mode ? "HD CAS 5-Tap (Upscale)" : "SD CAS 5-Tap (Upscale)");
+      } else if (dst_w * 100 >= video_width * 85 && dst_h * 100 >= video_height * 85) {
+          active_method = 3;
+          ui_set_active_scaling_name("Overscan Bilinear Fit");
       } else {
           active_method = 2;
           ui_set_active_scaling_name(is_hd_mode ? "HD 4-Tap Box (Downscale)" : "SD 4-Tap Box (Downscale)");

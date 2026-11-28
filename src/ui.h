@@ -47,6 +47,9 @@ const char* ui_get_pairing_pin(void);
 #define SCALING_MODE_SHADER   0 // Adaptive Shader Pipeline: CAS (upscale), 4-Tap Box (downscale), 1:1 Direct (equal)
 #define SCALING_MODE_LEGACY   1 // Legacy Pipeline: Tiny3D Bilinear / Direct (no custom shaders)
 
+#define OVERSCAN_MIN 0
+#define OVERSCAN_MAX 15
+
 int  ui_get_aspect_ratio(void);
 int  ui_get_stream_res_idx(void);
 void ui_set_stream_res_idx(int idx);
@@ -58,6 +61,12 @@ void ui_set_scaling_mode(int mode);
 const char* ui_get_scaling_mode_name(void);
 const char* ui_get_active_scaling_name(void);
 void ui_set_active_scaling_name(const char *name);
+
+int  ui_get_overscan_x(void);
+int  ui_get_overscan_y(void);
+void ui_set_overscan_x(int pct);
+void ui_set_overscan_y(int pct);
+void ui_get_safe_rect(int total_w, int total_h, int *out_x, int *out_y, int *out_w, int *out_h);
 
 // App selection state helpers
 void ui_set_app_list(const ps3_app_list_t *list);

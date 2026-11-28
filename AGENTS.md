@@ -38,7 +38,9 @@ PlayStation 3 client for Moonlight Game Streaming protocol (NVIDIA Shield / Suns
      - `src/main.c`: `STREAM_CONFIGURATION.width/height` set from active stream selection.
      - `src/input.c`: Absolute mouse position event dynamically scaled to active stream dimensions.
   6. **Settings & Persistence**:
-     - Persisted in `config.ini` as `aspect_ratio=0/1`, `res_16_9=0/1`, `res_4_3=0/1`, `scaling_mode=0/1`.
+     - Persisted in `config.ini` as `aspect_ratio=0/1`, `res_16_9=0/1`, `res_4_3=0/1`, `scaling_mode=0/1`, `overscan_16_9_x/y=0..15`, `overscan_4_3_x/y=0..15`.
+     - **Per-Mode X/Y Overscan & UI Safe Area**: `16:9` and `4:3` display modes maintain independent X/Y overscan percentages (`0%`–`15%`, even-aligned via `ui_get_safe_rect`). Both video output (`src/video.c` using `pixel_dar`/`safe_dar` aspect preservation and `Overscan Bilinear Fit` when scaling >= 85% of source to prevent 4-Tap Box text softening) and all Tiny3D UI elements / stats HUD (`src/ui.c` `UX`/`UY` safe-area mapping) conform to the calibrated safe rectangle.
+     - **Controller Mapping (`src/input.c`)**: DualShock 3 face buttons map by physical layout (`BTN_CROSS` -> `A_FLAG`, `BTN_CIRCLE` -> `B_FLAG`, `BTN_SQUARE` -> `X_FLAG`, `BTN_TRIANGLE` -> `Y_FLAG`).
      - Real-time telemetry HUD displays active stream input, display output, and active scaling engine status.
      - **Granular FPS Telemetry Pipeline**:
        - `Stream In`: Measures raw decode units entering from network (`ps3_video_submit_decode_unit`).
